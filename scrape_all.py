@@ -1,0 +1,562 @@
+"""Full pipeline: scrape ALL posts (video+image) and comments, write to Feishu."""
+import sys
+sys.stdout.reconfigure(errors='replace')
+import builtins
+_original_print = builtins.print
+def print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    _original_print(*args, **kwargs)
+
+import asyncio
+import os
+import time
+import zlib
+from datetime import datetime
+from playwright.async_api import async_playwright
+from core.client import DouyinClient
+from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY
+from storage.feishu import FeishuBitable
+from storage.downloader import download_file, download_video_media, cleanup_downloads, DOWNLOAD_DIR
+
+VIDEO_TABLE_ID = os.environ.get("VIDEO_TABLE_ID", "YOUR_VIDEO_TABLE_ID")
+IMAGE_TABLE_ID = os.environ.get("IMAGE_TABLE_ID", "YOUR_IMAGE_TABLE_ID")
+COMMENT_TABLE_ID = os.environ.get("COMMENT_TABLE_ID", "YOUR_COMMENT_TABLE_ID")
+KEYWORD = os.environ.get("DOUYIN_KEYWORD", "YOUR_KEYWORD")
+
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+"""
+
+
+async def _browser_search_images(keyword, seen_ids):
+    """Search for image/note posts via browser context.
+
+    The Douyin Web API only returns image posts through the
+    /general/search/single/ endpoint when called from a browser with proper
+    security context. We navigate to a known video page first (avoids captcha),
+    then call the API from within that page.
+    """
+    from urllib.parse import quote
+    results = []
+    encoded_kw = quote(keyword)
+    base_url = 'https://www.douyin.com/aweme/v1/web/general/search/single/'
+
+    for attempt in range(3):
+        pw = br = page = None
+        try:
+            pw = await async_playwright().start()
+            br = await pw.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+            )
+            ctx = await br.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                locale='zh-CN',
+                timezone_id='Asia/Shanghai',
+            )
+            await ctx.add_init_script(STEALTH_JS)
+            ck = []
+            for c in DOUYIN_COOKIE.split(';'):
+                c = c.strip()
+                if '=' in c:
+                    n, v = c.split('=', 1)
+                    ck.append({'name': n.strip(), 'value': v.strip(), 'domain': '.douyin.com', 'path': '/'})
+            await ctx.add_cookies(ck)
+            page = await ctx.new_page()
+
+            seed_url = 'https://www.douyin.com/video/7516474427211992377'
+            print(f'  Browser attempt {attempt+1}: navigating to seed page...')
+            try:
+                await page.goto(seed_url, wait_until='domcontentloaded', timeout=30000)
+            except Exception:
+                pass
+            await asyncio.sleep(6)
+
+            # Make a warmup call first (the first API call from a fresh page
+            # sometimes stalls; a quick throwaway fetch primes the connection)
+            try:
+                await asyncio.wait_for(page.evaluate(
+                    """async () => {
+                        try { await fetch('https://www.douyin.com/'); return true; }
+                        catch { return false; }
+                    }"""
+                ), timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+            # Now search with aweme_image_web channel
+            detail_ids = []
+            for offset in range(0, 200, 20):
+                url = (
+                    f'{base_url}?device_platform=webapp&aid=6383&channel=channel_pc_web'
+                    f'&search_channel=aweme_image_web&keyword={encoded_kw}'
+                    f'&search_source=tab_search&query_correct_type=1&is_filter_search=0'
+                    f'&offset={offset}&count=20&cookie_enabled=true&platform=PC'
+                )
+                data = await asyncio.wait_for(page.evaluate(
+                    """async (url) => {
+                        try {
+                            const resp = await fetch(url, {
+                                headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
+                                credentials: 'include',
+                            });
+                            return await resp.json();
+                        } catch (e) {
+                            return {status_code: -1, error: e.message};
+                        }
+                    }""", url
+                ), timeout=30)
+
+                if not data or data.get('status_code') != 0:
+                    break
+                items = data.get('data', [])
+                if not items:
+                    break
+                new_count = 0
+                for item in items:
+                    aweme = item.get('aweme_info', {})
+                    if not aweme:
+                        continue
+                    aweme_id = aweme.get('aweme_id', '')
+                    if not aweme_id or aweme_id in seen_ids:
+                        continue
+                    seen_ids.add(aweme_id)
+                    new_count += 1
+                    images = aweme.get('images') or []
+                    media_type = aweme.get('media_type', -1)
+                    aweme_type = aweme.get('aweme_type', 0)
+                    is_image = len(images) > 0 or media_type == 2 or aweme_type in (68, 150)
+                    if is_image and len(images) > 0:
+                        results.append(parse_post(aweme))
+                        print(f'    Image post: {aweme_id} ({len(images)} images)')
+                    elif is_image:
+                        detail_ids.append(aweme_id)
+                    else:
+                        results.append(parse_post(aweme))
+                if new_count == 0 or not data.get('has_more', 0):
+                    break
+                await asyncio.sleep(3)
+
+            # Fetch details for image posts missing image URLs
+            for aid in detail_ids:
+                detail_url = (
+                    f'{DOUYIN_API_BASE}/aweme/detail/'
+                    f'?device_platform=webapp&aid=6383&aweme_id={aid}'
+                    f'&cookie_enabled=true&platform=PC'
+                )
+                try:
+                    data = await asyncio.wait_for(page.evaluate(
+                        """async (url) => {
+                            try {
+                                const resp = await fetch(url, {
+                                    headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
+                                    credentials: 'include',
+                                });
+                                return await resp.json();
+                            } catch (e) { return null; }
+                        }""", detail_url
+                    ), timeout=20)
+                    if data:
+                        aweme = data.get('aweme_detail', {})
+                        if aweme:
+                            results.append(parse_post(aweme))
+                            print(f'    Detail: {aid} ({len(aweme.get("images") or [])} images)')
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+            break  # success, exit retry loop
+
+        except Exception as e:
+            print(f'  Browser attempt {attempt+1} failed: {e}')
+            if attempt < 2:
+                await asyncio.sleep(5)
+        finally:
+            try:
+                if br:
+                    await br.close()
+                if pw:
+                    await pw.stop()
+            except:
+                pass
+
+    image_count = sum(1 for p in results if p['type'] == 'image')
+    video_count = len(results) - image_count
+    print(f'  Browser phase: {video_count} videos, {image_count} images')
+    return results
+
+
+async def search_all_posts():
+    """Search for ALL posts (video + image/note) without engagement filter.
+
+    Video posts: use HTTP API /search/item/ (fast, no browser needed).
+    Image/note posts: use browser-based /general/search/single/ with aweme_image_web
+    channel, then fetch full detail for each to get image URLs.
+    """
+    all_posts = []
+    seen_ids = set()
+
+    # --- Phase 1: Video posts via HTTP API ---
+    print('[Phase 1] Searching video posts via HTTP API...')
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        channels = ['aweme_video_web', 'aweme_general']
+        for channel in channels:
+            for offset in range(0, 100, 20):
+                params = {
+                    'keyword': KEYWORD,
+                    'search_channel': channel,
+                    'sort_type': 0,
+                    'count': 20,
+                    'offset': offset,
+                    'search_source': 'normal_search',
+                    'cookie_enabled': 'true',
+                    'device_platform': 'webapp',
+                    'aid': '6383',
+                    'platform': 'PC',
+                }
+                data = await client.get(f'{DOUYIN_API_BASE}/search/item/', params=params)
+                if not data or data.get('status_code') != 0:
+                    break
+                items = data.get('data', [])
+                if not items:
+                    break
+                new_count = 0
+                for item in items:
+                    aweme = item.get('aweme_info', {})
+                    if not aweme:
+                        continue
+                    aweme_id = aweme.get('aweme_id', '')
+                    if aweme_id and aweme_id not in seen_ids:
+                        seen_ids.add(aweme_id)
+                        new_count += 1
+                        all_posts.append(parse_post(aweme))
+                if new_count == 0:
+                    break
+                if not data.get('has_more', 0):
+                    break
+                await asyncio.sleep(REQUEST_DELAY)
+
+    video_count = len(all_posts)
+    print(f'  Found {video_count} video posts')
+
+    # --- Phase 2: Image/note posts via browser-based general search API ---
+    print('[Phase 2] Searching image/note posts via browser API...')
+    image_posts_from_browser = await _browser_search_images(KEYWORD, seen_ids)
+    all_posts.extend(image_posts_from_browser)
+
+    image_count = sum(1 for p in all_posts if p['type'] == 'image')
+    print(f'Total unique posts found: {len(all_posts)}')
+    print(f'  Video: {len(all_posts) - image_count}, Image/Note: {image_count}')
+    return all_posts
+
+
+def parse_post(aweme):
+    """Parse a post (video or image/note) from the API response."""
+    stats = aweme.get('statistics') or {}
+    author = aweme.get('author') or {}
+    video = aweme.get('video') or {}
+    images = aweme.get('images') or []
+    create_ts = aweme.get('create_time', 0)
+    create_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(create_ts)) if create_ts else ''
+    aweme_id = aweme.get('aweme_id', '')
+
+    # Determine type
+    has_images = len(images) > 0
+    aweme_type = aweme.get('aweme_type', 0)
+    media_type = aweme.get('media_type', -1)
+    post_type = 'image' if has_images or aweme_type in (68, 150) or media_type == 2 else 'video'
+
+    # Cover
+    cover_url = ''
+    if video:
+        cover_obj = video.get('cover') or {}
+        cover_list = cover_obj.get('url_list') or []
+        cover_url = cover_list[0] if cover_list else ''
+
+    # Video URL
+    video_url = ''
+    play_addr = video.get('play_addr') or {}
+    if play_addr:
+        url_list = play_addr.get('url_list') or []
+        video_url = url_list[0] if url_list else ''
+
+    # Image URLs
+    image_urls = []
+    for img in images:
+        if img:
+            url_list = img.get('url_list') or []
+            if url_list:
+                image_urls.append(url_list[0])
+
+    # Hashtags
+    hashtags = []
+    for tag in (aweme.get('text_extra') or []):
+        if tag and tag.get('hashtag_name'):
+            hashtags.append(tag['hashtag_name'])
+
+    # Post URL (note format for image posts)
+    if post_type == 'image':
+        post_url = f'https://www.douyin.com/note/{aweme_id}'
+    else:
+        post_url = f'https://www.douyin.com/video/{aweme_id}'
+
+    sec_uid = author.get('sec_uid', '')
+
+    return {
+        'aweme_id': aweme_id,
+        'type': post_type,
+        'desc': aweme.get('desc', ''),
+        'author_nickname': author.get('nickname', ''),
+        'author_sec_uid': sec_uid,
+        'digg_count': stats.get('digg_count', 0),
+        'comment_count': stats.get('comment_count', 0),
+        'collect_count': stats.get('collect_count', 0),
+        'share_count': stats.get('share_count', 0),
+        'create_time': create_str,
+        'cover_url': cover_url,
+        'video_url': video_url,
+        'image_urls': image_urls,
+        'post_url': post_url,
+        'author_homepage': f'https://www.douyin.com/user/{sec_uid}' if sec_uid else '',
+        'hashtags': ', '.join(hashtags),
+    }
+
+
+def download_and_upload_media(post, feishu):
+    """Download media and upload to Feishu. Returns file tokens dict."""
+    aweme_id = post['aweme_id']
+    tokens = {'cover': '', 'video': '', 'images': []}
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # Download and upload cover
+    if post['cover_url']:
+        path = download_file(post['cover_url'], f'{aweme_id}_cover.jpg')
+        if path:
+            token = feishu.upload_file(path, 'bitable_image')
+            if token:
+                tokens['cover'] = token
+
+    # Download and upload video (for video posts)
+    if post['type'] == 'video' and post['video_url']:
+        path = download_file(post['video_url'], f'{aweme_id}_video.mp4', timeout=180)
+        if path:
+            token = feishu.upload_file(path, 'bitable_file')
+            if token:
+                tokens['video'] = token
+
+    # Download and upload images (for image posts or any post with images)
+    for i, url in enumerate(post['image_urls']):
+        path = download_file(url, f'{aweme_id}_img_{i}.jpg')
+        if path:
+            token = feishu.upload_file(path, 'bitable_image')
+            if token:
+                tokens['images'].append(token)
+
+    return tokens
+
+
+def build_record(post, tokens):
+    """Build a Feishu record from post data and uploaded file tokens."""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    record = {
+        '作者': post['author_nickname'],
+        '作品正文': post['desc'],
+        '作品链接': post['post_url'],
+        '作者主页': post['author_homepage'],
+        '点赞数': post['digg_count'],
+        '评论数': post['comment_count'],
+        '收藏数': post['collect_count'],
+        '分享数': post['share_count'],
+        '发布时间': post['create_time'],
+        '话题标签': post['hashtags'],
+        '搜索关键词': KEYWORD,
+        '爬取时间': now,
+    }
+
+    # Add file attachments (only if token exists)
+    if tokens['cover']:
+        record['作品封面'] = [{'file_token': tokens['cover']}]
+    if tokens['video']:
+        record['作品视频'] = [{'file_token': tokens['video']}]
+    if tokens['images']:
+        record['作品图片'] = [{'file_token': t} for t in tokens['images']]
+
+    return record
+
+
+async def fetch_comments_for_posts(posts):
+    """Fetch first-level comments for all posts using browser."""
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+    )
+    context = await browser.new_context(
+        viewport={'width': 1920, 'height': 1080},
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        locale='zh-CN',
+        timezone_id='Asia/Shanghai',
+    )
+    await context.add_init_script(STEALTH_JS)
+
+    cookies = []
+    for item in DOUYIN_COOKIE.split(';'):
+        item = item.strip()
+        if '=' in item:
+            n, v = item.split('=', 1)
+            cookies.append({'name': n.strip(), 'value': v.strip(), 'domain': '.douyin.com', 'path': '/'})
+    await context.add_cookies(cookies)
+
+    page = await context.new_page()
+    all_records = []
+
+    for vi, post in enumerate(posts):
+        aweme_id = post['aweme_id']
+        comment_count = post['comment_count']
+        if comment_count == 0:
+            print(f'  [{vi+1}/{len(posts)}] Skip {aweme_id} (0 comments)')
+            continue
+
+        print(f'  [{vi+1}/{len(posts)}] {aweme_id} (comments: {comment_count})')
+
+        # Navigate to video page (comments work from video URL even for note posts)
+        try:
+            await page.goto(
+                f'https://www.douyin.com/video/{aweme_id}',
+                wait_until='domcontentloaded', timeout=30000
+            )
+        except:
+            pass
+        await asyncio.sleep(4)
+
+        cursor = 0
+        video_comments = 0
+        max_comments = min(comment_count, 100)
+
+        while video_comments < max_comments:
+            url = (
+                f'{DOUYIN_API_BASE}/comment/list/'
+                f'?aweme_id={aweme_id}'
+                f'&cursor={cursor}&count=20'
+                f'&item_type=0'
+                f'&device_platform=webapp&aid=6383'
+                f'&cookie_enabled=true&platform=PC'
+            )
+            try:
+                data = await asyncio.wait_for(
+                    page.evaluate(
+                        """async (url) => {
+                            const resp = await fetch(url, {
+                                headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
+                                credentials: 'include',
+                            });
+                            return await resp.json();
+                        }""", url
+                    ), timeout=30
+                )
+            except:
+                break
+
+            if not data or data.get('status_code') != 0:
+                break
+            comments = data.get('comments', [])
+            if not comments:
+                break
+
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for c in comments:
+                user = c.get('user', {})
+                ct = c.get('create_time', 0)
+                record = {
+                    '评论内容': c.get('text', ''),
+                    '评论者昵称': user.get('nickname', ''),
+                    '评论者ID': user.get('uid', ''),
+                    '评论层级': '一级评论',
+                    '所属视频ID': aweme_id,
+                    '所属视频描述': (post['desc'] or '')[:100],
+                    '点赞数': c.get('digg_count', 0),
+                    '回复数': c.get('reply_comment_total', 0),
+                    '评论时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ct)) if ct else '',
+                    '搜索关键词': KEYWORD,
+                    '爬取时间': now,
+                }
+                all_records.append(record)
+                video_comments += 1
+                if video_comments >= max_comments:
+                    break
+
+            if not data.get('has_more', 0):
+                break
+            cursor = data.get('cursor', 0)
+            await asyncio.sleep(REQUEST_DELAY)
+
+        print(f'    Got {video_comments} comments')
+
+    await browser.close()
+    await pw.stop()
+    return all_records
+
+
+async def main():
+    print('=== Step 1: Search ALL posts (video + image) ===')
+    posts = await search_all_posts()
+    if not posts:
+        print('No posts found!')
+        return
+
+    video_posts = [p for p in posts if p['type'] == 'video']
+    image_posts = [p for p in posts if p['type'] == 'image']
+    print(f'Video posts: {len(video_posts)}, Image posts: {len(image_posts)}')
+
+    print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
+    feishu = FeishuBitable()
+
+    # Clear old records in both tables
+    feishu.delete_all_records(VIDEO_TABLE_ID)
+    feishu.delete_all_records(IMAGE_TABLE_ID)
+
+    video_records = []
+    image_records = []
+    for i, post in enumerate(posts):
+        print(f'  [{i+1}/{len(posts)}] {post["type"]} - {post["aweme_id"]}')
+        tokens = download_and_upload_media(post, feishu)
+        record = build_record(post, tokens)
+        if post['type'] == 'video':
+            video_records.append(record)
+        else:
+            image_records.append(record)
+        cleanup_downloads()
+
+    if video_records:
+        written = feishu.write_records(video_records, VIDEO_TABLE_ID)
+        print(f'Written {written}/{len(video_records)} video records')
+    if image_records:
+        written = feishu.write_records(image_records, IMAGE_TABLE_ID)
+        print(f'Written {written}/{len(image_records)} image records')
+    feishu.close()
+
+    print(f'\n=== Step 3: Fetch comments for all {len(posts)} posts ===')
+    comment_records = await fetch_comments_for_posts(posts)
+    print(f'Total comment records: {len(comment_records)}')
+
+    if comment_records:
+        print('\n=== Step 4: Write comments to Feishu ===')
+        feishu = FeishuBitable()
+        feishu.delete_all_records(COMMENT_TABLE_ID)
+        written = feishu.write_records(comment_records, COMMENT_TABLE_ID)
+        print(f'Written {written} comment records')
+        feishu.close()
+
+    print('\n=== Done ===')
+    print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
+    print(f'Comments: {len(comment_records)}')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

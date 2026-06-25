@@ -1,0 +1,216 @@
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import click
+
+from core.client import DouyinClient
+from core.browser import DouyinBrowser
+from scrapers.keyword import KeywordScraper
+from scrapers.user import UserScraper
+from scrapers.video import VideoScraper
+from scrapers.trending import TrendingScraper
+from storage.feishu import (
+    FeishuBitable,
+    video_to_feishu_record,
+    user_to_feishu_record,
+    comment_to_feishu_record,
+    trending_to_feishu_record,
+)
+from storage.local import LocalStorage
+from config.settings import DOUYIN_COOKIE, FEISHU_APP_ID
+
+
+@click.group()
+def cli():
+    """抖音数据爬取工具 — 支持关键词搜索、作者主页、评论、热搜"""
+    pass
+
+
+@cli.command()
+def login():
+    """打开浏览器登录抖音，保存 Cookie 供后续爬取使用"""
+    asyncio.run(_login())
+
+
+async def _login():
+    browser = DouyinBrowser()
+    await browser.start(headless=False)
+    click.echo("浏览器已打开，请在浏览器中：")
+    click.echo("  1. 登录你的抖音账号")
+    click.echo("  2. 如果出现验证码，请手动完成验证")
+    click.echo("  3. 登录成功后，尝试搜索一个关键词确认正常")
+    click.echo("  4. 完成后回到终端按回车键保存 Cookie\n")
+
+    await browser.navigate("https://www.douyin.com")
+
+    input("按回车键保存 Cookie 并关闭浏览器...")
+
+    await browser.save_cookies()
+    await browser.close()
+    click.echo("\nCookie 已保存！后续爬取将自动使用这些 Cookie。")
+
+
+@cli.command()
+@click.argument("keyword")
+@click.option("--max-count", "-n", default=50, help="最大爬取数量")
+@click.option("--sort", "-s", type=click.Choice(["综合", "最新", "最热"]), default="综合")
+@click.option("--type", "search_type", type=click.Choice(["video", "user"]), default="video")
+@click.option("--feishu-table", help="飞书表格 table_id（不指定则用 .env 配置或本地存储）")
+@click.option("--local", "save_local", is_flag=True, help="同时保存到本地 CSV")
+def search(keyword, max_count, sort, search_type, feishu_table, save_local):
+    """按关键词搜索抖音视频或用户"""
+    sort_map = {"综合": 0, "最新": 1, "最热": 2}
+    asyncio.run(
+        _search(keyword, max_count, sort_map[sort], search_type, feishu_table, save_local)
+    )
+
+
+async def _search(keyword, max_count, sort_type, search_type, feishu_table, save_local):
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        scraper = KeywordScraper(client)
+
+        if search_type == "video":
+            results = await scraper.search_videos(keyword, max_count, sort_type)
+            records = [video_to_feishu_record(v) for v in results]
+            _output(records, feishu_table, save_local, f"search_videos_{keyword}", "video")
+        else:
+            results = await scraper.search_users(keyword, max_count)
+            records = [user_to_feishu_record(u) for u in results]
+            _output(records, feishu_table, save_local, f"search_users_{keyword}", "user")
+
+
+@cli.command()
+@click.argument("url")
+@click.option("--max-videos", "-n", default=50, help="最大视频爬取数量")
+@click.option("--info-only", is_flag=True, help="仅获取用户信息，不爬取视频列表")
+@click.option("--feishu-table", help="飞书表格 table_id")
+@click.option("--local", "save_local", is_flag=True, help="同时保存到本地 CSV")
+def user(url, max_videos, info_only, feishu_table, save_local):
+    """从作者主页链接爬取用户信息和视频列表"""
+    asyncio.run(_user(url, max_videos, info_only, feishu_table, save_local))
+
+
+async def _user(url, max_videos, info_only, feishu_table, save_local):
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        scraper = UserScraper(client)
+
+        user_info = await scraper.get_user_info(url)
+        if user_info:
+            click.echo(f"\n用户: {user_info.nickname}")
+            click.echo(f"粉丝: {user_info.follower_count} | 关注: {user_info.following_count}")
+            click.echo(f"获赞: {user_info.total_favorited} | 作品: {user_info.aweme_count}")
+            click.echo(f"简介: {user_info.signature}\n")
+
+            user_records = [user_to_feishu_record(user_info)]
+            _output(user_records, feishu_table, save_local, f"user_{user_info.nickname}", "user")
+
+        if not info_only:
+            videos = await scraper.get_user_videos(url, max_videos)
+            if videos:
+                records = [video_to_feishu_record(v) for v in videos]
+                _output(records, feishu_table, save_local, f"user_videos_{user_info.nickname if user_info else 'unknown'}", "video")
+
+
+@cli.command()
+@click.argument("aweme_id")
+@click.option("--comments", "-c", is_flag=True, help="同时爬取评论")
+@click.option("--max-comments", "-n", default=100, help="最大评论爬取数量")
+@click.option("--feishu-table", help="飞书表格 table_id")
+@click.option("--local", "save_local", is_flag=True, help="同时保存到本地 CSV")
+@click.option("--headless/--no-headless", default=True)
+def video(aweme_id, comments, max_comments, feishu_table, save_local, headless):
+    """获取视频详情（可选：爬取评论）"""
+    asyncio.run(_video(aweme_id, comments, max_comments, feishu_table, save_local, headless))
+
+
+async def _video(aweme_id, comments, max_comments, feishu_table, save_local, headless):
+    async with DouyinBrowser() as browser:
+        await browser.start(headless=headless)
+        scraper = VideoScraper(browser)
+
+        detail = await scraper.get_video_detail(aweme_id)
+        if detail:
+            click.echo(f"\n视频: {detail.get('desc', '')}")
+            stats = detail.get("statistics", {})
+            click.echo(
+                f"播放: {stats.get('play_count', 0)} | "
+                f"点赞: {stats.get('digg_count', 0)} | "
+                f"评论: {stats.get('comment_count', 0)}"
+            )
+
+        if comments:
+            comment_list = await scraper.get_comments(aweme_id, max_comments)
+            if comment_list:
+                records = [comment_to_feishu_record(c) for c in comment_list]
+                _output(records, feishu_table, save_local, f"comments_{aweme_id}", "comment")
+
+
+@cli.command()
+@click.option("--feishu-table", help="飞书表格 table_id")
+@click.option("--local", "save_local", is_flag=True, help="同时保存到本地 CSV")
+@click.option("--headless/--no-headless", default=True)
+def trending(feishu_table, save_local, headless):
+    """获取抖音热搜榜"""
+    asyncio.run(_trending(feishu_table, save_local, headless))
+
+
+async def _trending(feishu_table, save_local, headless):
+    async with DouyinBrowser() as browser:
+        await browser.start(headless=headless)
+        scraper = TrendingScraper(browser)
+        items = await scraper.get_hot_search()
+
+        if items:
+            click.echo(f"\n抖音热搜榜 (共 {len(items)} 条):\n")
+            for item in items[:10]:
+                click.echo(f"  {item.rank}. {item.title} (热度: {item.hot_value})")
+            if len(items) > 10:
+                click.echo(f"  ... 共 {len(items)} 条\n")
+
+            records = [trending_to_feishu_record(t) for t in items]
+            _output(records, feishu_table, save_local, "trending", "trending")
+
+
+@cli.command()
+@click.option("--type", "table_type", type=click.Choice(["video", "user", "comment", "trending"]), required=True)
+@click.option("--table-id", required=True, help="飞书表格 table_id")
+def setup_feishu(table_type, table_id):
+    """初始化飞书多维表格的字段结构"""
+    feishu = FeishuBitable()
+    setup_map = {
+        "video": feishu.setup_video_table,
+        "user": feishu.setup_user_table,
+        "comment": feishu.setup_comment_table,
+        "trending": feishu.setup_trending_table,
+    }
+    setup_map[table_type](table_id)
+    click.echo(f"已初始化 {table_type} 类型的表格字段结构")
+    feishu.close()
+
+
+def _output(records, feishu_table, save_local, name, data_type):
+    if not records:
+        click.echo("没有数据可输出。")
+        return
+
+    if feishu_table or FEISHU_APP_ID:
+        try:
+            feishu = FeishuBitable()
+            table_id = feishu_table or ""
+            feishu.write_records(records, table_id)
+            feishu.close()
+        except Exception as e:
+            click.echo(f"飞书写入失败: {e}，回退到本地存储")
+            save_local = True
+
+    if save_local or not FEISHU_APP_ID:
+        local = LocalStorage()
+        local.save_csv(records, f"{name}.csv")
+        local.save_json(records, f"{name}.json")
+
+
+if __name__ == "__main__":
+    cli()
