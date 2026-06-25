@@ -97,12 +97,60 @@ The browser navigates to a specific video page first (avoids captcha), then call
 Image posts: `aweme_type` in (68, 150), or `media_type == 2`, or `images` array is non-empty.
 Video posts: everything else. Image posts use `/note/{id}` URLs; video posts use `/video/{id}`.
 
+## Date / Time Range Filtering
+
+Search results can be limited by publish time through two complementary mechanisms (shared logic lives in `core/datefilter.py`, used by both entry points and both search phases):
+
+### 1. Predefined range (`publish_time`) — server-side
+
+Douyin's search API understands a coarse `publish_time` filter, passed via `filter_selected`:
+
+| Value | Meaning |
+|-------|---------|
+| `0`   | 不限 (no limit, default) |
+| `1`   | 一天内 (within 1 day) |
+| `7`   | 一周内 (within 1 week) |
+| `182` | 半年内 (within half a year) |
+
+### 2. Custom range (`start_date` / `end_date`) — client-side
+
+The API has no native arbitrary-date support, so any custom window is enforced client-side using each result's `create_time`. Bounds are **inclusive** and the end date covers the whole day (up to `23:59:59`). Posts outside the window — or with a missing timestamp — are dropped.
+
+Pagination advances by the **raw discovered count**, so a page whose results are entirely trimmed by the date filter still pages on toward older posts instead of stopping early. Crawling is still capped by `MAX_PAGES`.
+
+### Usage
+
+CLI (`main.py search`, video search only):
+
+```bash
+# Predefined: posts from the last week
+python main.py search "keyword" --publish-time 7
+
+# Custom window: 2025-01-01 .. 2025-06-01 (both inclusive)
+python main.py search "keyword" --start-date 2025-01-01 --end-date 2025-06-01
+
+# Open-ended: everything since 2025-01-01
+python main.py search "keyword" --start-date 2025-01-01
+```
+
+Full pipeline (`scrape_all.py`) — via environment variables / `.env`:
+
+```bash
+DOUYIN_PUBLISH_TIME=7                 # predefined range (0/1/7/182)
+DOUYIN_START_DATE=2025-01-01          # custom lower bound (inclusive)
+DOUYIN_END_DATE=2025-06-01            # custom upper bound (inclusive)
+```
+
+Invalid input is rejected up front: a malformed date, a `publish_time` outside `{0,1,7,182}`, or a `start-date` later than `end-date` all raise a clear error before any network call.
+
 ## CLI Commands (main.py)
 
 For simpler one-off tasks (no full pipeline needed):
 
 ```bash
 python main.py search "keyword" -n 50       # Keyword search (video only)
+python main.py search "keyword" --publish-time 7              # ...within the last week
+python main.py search "keyword" --start-date 2025-01-01 --end-date 2025-06-01  # ...custom date range
 python main.py user "https://..." -n 100     # Author profile (all post types)
 python main.py trending                       # Trending videos
 python main.py video VIDEO_ID --comments     # Single video details + comments

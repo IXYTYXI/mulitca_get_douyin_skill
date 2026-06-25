@@ -12,6 +12,7 @@ from scrapers.keyword import KeywordScraper
 from scrapers.user import UserScraper
 from scrapers.video import VideoScraper
 from scrapers.trending import TrendingScraper
+from core.datefilter import DateFilter
 from storage.feishu import (
     FeishuBitable,
     video_to_feishu_record,
@@ -58,22 +59,38 @@ async def _login():
 @click.option("--max-count", "-n", default=50, help="最大爬取数量")
 @click.option("--sort", "-s", type=click.Choice(["综合", "最新", "最热"]), default="综合")
 @click.option("--type", "search_type", type=click.Choice(["video", "user"]), default="video")
+@click.option("--publish-time", type=click.Choice(["0", "1", "7", "182"]), default="0",
+              help="发布时间预设范围: 0=不限 1=一天内 7=一周内 182=半年内")
+@click.option("--start-date", help="自定义起始日期 (含当天), 格式 YYYY-MM-DD, 仅对 video 生效")
+@click.option("--end-date", help="自定义结束日期 (含当天), 格式 YYYY-MM-DD, 仅对 video 生效")
 @click.option("--feishu-table", help="飞书表格 table_id（不指定则用 .env 配置或本地存储）")
 @click.option("--local", "save_local", is_flag=True, help="同时保存到本地 CSV")
-def search(keyword, max_count, sort, search_type, feishu_table, save_local):
+def search(keyword, max_count, sort, search_type, publish_time, start_date, end_date, feishu_table, save_local):
     """按关键词搜索抖音视频或用户"""
     sort_map = {"综合": 0, "最新": 1, "最热": 2}
+    # Validate date inputs early (before opening any network session).
+    try:
+        DateFilter.from_inputs(publish_time, start_date, end_date)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    if search_type == "user" and (start_date or end_date or publish_time != "0"):
+        click.echo("提示: 日期过滤仅对视频搜索 (--type video) 生效，用户搜索将忽略。")
     asyncio.run(
-        _search(keyword, max_count, sort_map[sort], search_type, feishu_table, save_local)
+        _search(keyword, max_count, sort_map[sort], search_type,
+                publish_time, start_date, end_date, feishu_table, save_local)
     )
 
 
-async def _search(keyword, max_count, sort_type, search_type, feishu_table, save_local):
+async def _search(keyword, max_count, sort_type, search_type,
+                  publish_time, start_date, end_date, feishu_table, save_local):
     async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
         scraper = KeywordScraper(client)
 
         if search_type == "video":
-            results = await scraper.search_videos(keyword, max_count, sort_type)
+            results = await scraper.search_videos(
+                keyword, max_count, sort_type,
+                publish_time=publish_time, start_date=start_date, end_date=end_date,
+            )
             records = [video_to_feishu_record(v) for v in results]
             _output(records, feishu_table, save_local, f"search_videos_{keyword}", "video")
         else:

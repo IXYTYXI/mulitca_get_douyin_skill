@@ -2,6 +2,7 @@ import time
 from typing import List
 
 from core.client import DouyinClient
+from core.datefilter import DateFilter
 from config.settings import DOUYIN_API_BASE, MAX_PAGES, REQUEST_DELAY, DOUYIN_COOKIE
 from models.data import VideoInfo, UserInfo
 
@@ -17,11 +18,28 @@ class KeywordScraper:
         keyword: str,
         max_count: int = 50,
         sort_type: int = 0,
+        publish_time=None,
+        start_date: str = None,
+        end_date: str = None,
     ) -> List[VideoInfo]:
+        """Search videos by keyword with optional date/time filtering.
+
+        ``publish_time`` selects a predefined server-side range (0/1/7/182);
+        ``start_date`` / ``end_date`` (``YYYY-MM-DD``) apply a client-side
+        custom window using each result's ``create_time`` (inclusive of the
+        end day). Pagination advances by the raw discovered count, so a page
+        whose results are all trimmed by the date filter does not stop the
+        crawl — it keeps paging toward older posts.
+        """
+        date_filter = DateFilter.from_inputs(publish_time, start_date, end_date)
+        if date_filter.is_active:
+            print(f"[Search] Date filter active: {date_filter.describe()}")
+
         results: List[VideoInfo] = []
         offset = 0
         count_per_page = 20
         seen_ids = set()
+        dropped = 0
 
         for page in range(MAX_PAGES):
             if len(results) >= max_count:
@@ -44,6 +62,7 @@ class KeywordScraper:
                 "platform": "PC",
                 "pc_client_type": "1",
             }
+            date_filter.apply_search_params(params)
 
             data = await self.client.get(
                 f"{DOUYIN_API_BASE}/search/item/", params=params
@@ -64,13 +83,20 @@ class KeywordScraper:
                 if aweme_id in seen_ids:
                     continue
                 seen_ids.add(aweme_id)
+                if not date_filter.matches(aweme.get("create_time", 0)):
+                    dropped += 1
+                    continue
                 results.append(self._parse_video(aweme))
+                if len(results) >= max_count:
+                    break
 
             has_more = data.get("has_more", 0)
             if not has_more:
                 break
             offset += count_per_page
 
+        if date_filter.has_custom_range:
+            print(f"[Search] Dropped {dropped} videos outside the date range")
         print(f"[Search] Found {len(results)} videos for keyword '{keyword}'")
         return results[:max_count]
 

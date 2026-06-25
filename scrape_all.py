@@ -12,8 +12,10 @@ import os
 import time
 import zlib
 from datetime import datetime
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 from core.client import DouyinClient
+from core.datefilter import DateFilter
 from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY
 from storage.feishu import FeishuBitable
 from storage.downloader import download_file, download_video_media, cleanup_downloads, DOWNLOAD_DIR
@@ -22,6 +24,16 @@ VIDEO_TABLE_ID = os.environ.get("VIDEO_TABLE_ID", "YOUR_VIDEO_TABLE_ID")
 IMAGE_TABLE_ID = os.environ.get("IMAGE_TABLE_ID", "YOUR_IMAGE_TABLE_ID")
 COMMENT_TABLE_ID = os.environ.get("COMMENT_TABLE_ID", "YOUR_COMMENT_TABLE_ID")
 KEYWORD = os.environ.get("DOUYIN_KEYWORD", "YOUR_KEYWORD")
+
+# Date / time-range filter, configured via environment variables:
+#   DOUYIN_PUBLISH_TIME  predefined server-side range (0/1/7/182), default 0
+#   DOUYIN_START_DATE    custom client-side lower bound, YYYY-MM-DD (inclusive)
+#   DOUYIN_END_DATE      custom client-side upper bound, YYYY-MM-DD (inclusive)
+DATE_FILTER = DateFilter.from_inputs(
+    os.environ.get("DOUYIN_PUBLISH_TIME", "0"),
+    os.environ.get("DOUYIN_START_DATE") or None,
+    os.environ.get("DOUYIN_END_DATE") or None,
+)
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -32,18 +44,30 @@ Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
 """
 
 
-async def _browser_search_images(keyword, seen_ids):
+async def _browser_search_images(keyword, seen_ids, date_filter=None):
     """Search for image/note posts via browser context.
 
     The Douyin Web API only returns image posts through the
     /general/search/single/ endpoint when called from a browser with proper
     security context. We navigate to a known video page first (avoids captcha),
     then call the API from within that page.
+
+    ``date_filter`` (a :class:`DateFilter`) adds the server-side
+    ``filter_selected`` range to the request URL and trims results outside the
+    custom ``start_date`` / ``end_date`` window client-side.
     """
-    from urllib.parse import quote
+    date_filter = date_filter or DateFilter()
     results = []
+    dropped = 0
     encoded_kw = quote(keyword)
     base_url = 'https://www.douyin.com/aweme/v1/web/general/search/single/'
+
+    # Server-side filter suffix (empty when publish_time == 0).
+    filter_selected = date_filter.filter_selected
+    if filter_selected is not None:
+        filter_suffix = f'&is_filter_search=1&filter_selected={quote(filter_selected)}'
+    else:
+        filter_suffix = '&is_filter_search=0'
 
     for attempt in range(3):
         pw = br = page = None
@@ -96,7 +120,7 @@ async def _browser_search_images(keyword, seen_ids):
                 url = (
                     f'{base_url}?device_platform=webapp&aid=6383&channel=channel_pc_web'
                     f'&search_channel=aweme_image_web&keyword={encoded_kw}'
-                    f'&search_source=tab_search&query_correct_type=1&is_filter_search=0'
+                    f'&search_source=tab_search&query_correct_type=1{filter_suffix}'
                     f'&offset={offset}&count=20&cookie_enabled=true&platform=PC'
                 )
                 data = await asyncio.wait_for(page.evaluate(
@@ -127,7 +151,10 @@ async def _browser_search_images(keyword, seen_ids):
                     if not aweme_id or aweme_id in seen_ids:
                         continue
                     seen_ids.add(aweme_id)
-                    new_count += 1
+                    new_count += 1  # raw discovery — drives pagination even if date-trimmed
+                    if not date_filter.matches(aweme.get('create_time', 0)):
+                        dropped += 1
+                        continue
                     images = aweme.get('images') or []
                     media_type = aweme.get('media_type', -1)
                     aweme_type = aweme.get('aweme_type', 0)
@@ -188,6 +215,8 @@ async def _browser_search_images(keyword, seen_ids):
 
     image_count = sum(1 for p in results if p['type'] == 'image')
     video_count = len(results) - image_count
+    if date_filter.has_custom_range:
+        print(f'  Browser phase: dropped {dropped} posts outside the date range')
     print(f'  Browser phase: {video_count} videos, {image_count} images')
     return results
 
@@ -201,6 +230,10 @@ async def search_all_posts():
     """
     all_posts = []
     seen_ids = set()
+    dropped = 0
+
+    if DATE_FILTER.is_active:
+        print(f'[Date filter] {DATE_FILTER.describe()}')
 
     # --- Phase 1: Video posts via HTTP API ---
     print('[Phase 1] Searching video posts via HTTP API...')
@@ -220,6 +253,7 @@ async def search_all_posts():
                     'aid': '6383',
                     'platform': 'PC',
                 }
+                DATE_FILTER.apply_search_params(params)
                 data = await client.get(f'{DOUYIN_API_BASE}/search/item/', params=params)
                 if not data or data.get('status_code') != 0:
                     break
@@ -234,7 +268,10 @@ async def search_all_posts():
                     aweme_id = aweme.get('aweme_id', '')
                     if aweme_id and aweme_id not in seen_ids:
                         seen_ids.add(aweme_id)
-                        new_count += 1
+                        new_count += 1  # raw discovery — drives pagination even if date-trimmed
+                        if not DATE_FILTER.matches(aweme.get('create_time', 0)):
+                            dropped += 1
+                            continue
                         all_posts.append(parse_post(aweme))
                 if new_count == 0:
                     break
@@ -243,11 +280,13 @@ async def search_all_posts():
                 await asyncio.sleep(REQUEST_DELAY)
 
     video_count = len(all_posts)
+    if DATE_FILTER.has_custom_range:
+        print(f'  Dropped {dropped} video posts outside the date range')
     print(f'  Found {video_count} video posts')
 
     # --- Phase 2: Image/note posts via browser-based general search API ---
     print('[Phase 2] Searching image/note posts via browser API...')
-    image_posts_from_browser = await _browser_search_images(KEYWORD, seen_ids)
+    image_posts_from_browser = await _browser_search_images(KEYWORD, seen_ids, DATE_FILTER)
     all_posts.extend(image_posts_from_browser)
 
     image_count = sum(1 for p in all_posts if p['type'] == 'image')
