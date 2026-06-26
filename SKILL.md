@@ -234,7 +234,18 @@ python main.py scrape-to-bitable "关键词" --folder <folder> --headed
 # or for scrape_all.py: set DOUYIN_HEADLESS=0
 ```
 
-Note: `--headed` improves **image search** stability but does **not** unblock **second-level (reply) comments** — the reply endpoint is guarded by `bd-ticket-guard` and returns empty regardless of headless/headed. First-level comments and video search work in both modes.
+Note: `--headed` improves **image search** stability. For **second-level (reply) comments**, the reply *API* is guarded by `bd-ticket-guard` and returns empty to hand-built requests — use the UI-click scraper below instead.
+
+### Second-level comments via simulated clicks (`--ui-comments`)
+
+Because the reply API is blocked, get replies the way a real user does: scroll the comment panel, **click every "展开N条回复"** so Douyin's own JS makes the signed request and the replies render into the DOM, then read them. This needs a logged-in, headed browser.
+
+```bash
+python main.py scrape-to-bitable "关键词" --folder <folder> --ui-comments
+# (--ui-comments auto-enables --headed)
+```
+
+Implemented in `core/comment_ui.py` (`scrape_comments_ui`) and wired into the pipeline via `USE_UI_COMMENTS`. Verified: a single video yielded 40 first-level + 265 second-level replies. Caveat: a small fraction of replies may lose the author name on DOM edge cases; content and reply target are still captured.
 
 ## Known Limitations
 
