@@ -54,6 +54,12 @@ ENGAGEMENT_LOGIC = os.environ.get("ENGAGEMENT_LOGIC", "or").lower()
 # types are represented up to the cap.
 MAX_POSTS = int(os.environ.get("MAX_POSTS_TOTAL", "0"))
 
+# Comment scraping bounds — keep runtime tractable. Fetching second-level
+# replies for every first-level comment explodes on viral posts, so cap them.
+MAX_COMMENTS_PER_POST = int(os.environ.get("MAX_COMMENTS_PER_POST", "100"))  # L1 per post
+MAX_REPLIES_PER_L1 = int(os.environ.get("MAX_REPLIES_PER_L1", "20"))         # L2 per L1 comment
+MAX_REPLIES_PER_POST = int(os.environ.get("MAX_REPLIES_PER_POST", "60"))     # L2 total per post (0 = no cap)
+
 
 def _passes_engagement(post):
     if MIN_ENGAGEMENT <= 0:
@@ -619,7 +625,7 @@ async def fetch_comments_for_posts(posts):
         cursor = 0
         video_comments = 0
         video_replies = 0
-        max_comments = min(comment_count, 100)
+        max_comments = min(comment_count, MAX_COMMENTS_PER_POST)
 
         while video_comments < max_comments:
             url = (
@@ -657,9 +663,11 @@ async def fetch_comments_for_posts(posts):
                     '爬取时间': now,
                 })
                 video_comments += 1
-                # Fetch second-level replies for this comment (if any)
-                if reply_total and cid:
-                    replies = await _fetch_replies(page, aweme_id, cid, user.get('nickname', ''))
+                # Fetch second-level replies (bounded per L1 and per post)
+                post_budget_left = (MAX_REPLIES_PER_POST - video_replies) if MAX_REPLIES_PER_POST else MAX_REPLIES_PER_L1
+                if reply_total and cid and post_budget_left > 0:
+                    cap = min(MAX_REPLIES_PER_L1, post_budget_left)
+                    replies = await _fetch_replies(page, aweme_id, cid, user.get('nickname', ''), max_replies=cap)
                     l2_records.extend(replies)
                     video_replies += len(replies)
                 if video_comments >= max_comments:
