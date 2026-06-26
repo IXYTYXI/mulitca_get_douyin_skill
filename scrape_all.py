@@ -63,6 +63,13 @@ MAX_REPLIES_PER_POST = int(os.environ.get("MAX_REPLIES_PER_POST", "60"))     # L
 # blocked/empty. Skip it entirely, fail fast, and give up on a post after a few
 # consecutive empty reply fetches so it can never stall the L1 crawl.
 SKIP_L2 = os.environ.get("SKIP_L2", "").lower() in ("1", "true", "yes")
+
+# Launch the Playwright browser headless (default) or headed/visible. A headed
+# local browser is more stable in some runtimes (the headless one crashes with
+# TargetClosedError) and trips Douyin's anti-bot less often, which can recover
+# image-search (Phase 2) and reply (L2) data. Set DOUYIN_HEADLESS=0 or pass
+# --headed to use a visible browser. main.py may override this attribute.
+HEADLESS = os.environ.get("DOUYIN_HEADLESS", "1").lower() not in ("0", "false", "no")
 L2_REPLY_TIMEOUT = int(os.environ.get("L2_REPLY_TIMEOUT", "8"))   # seconds per reply fetch
 L2_DRY_GIVEUP = int(os.environ.get("L2_DRY_GIVEUP", "3"))         # consecutive empty fetches -> stop L2 for this post
 
@@ -138,7 +145,7 @@ async def _browser_search_images(keyword, seen_ids, date_filter=None):
         try:
             pw = await async_playwright().start()
             br = await pw.chromium.launch(
-                headless=True,
+                headless=HEADLESS,
                 args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
             )
             ctx = await br.new_context(
@@ -586,7 +593,7 @@ async def fetch_comments_for_posts(posts):
     """
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
-        headless=True,
+        headless=HEADLESS,
         args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
     )
     context = await browser.new_context(

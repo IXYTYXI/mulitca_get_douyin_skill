@@ -225,6 +225,17 @@ Tuning knobs (env / `.env`, defaults shown):
 
 If you still see frequent empty results, raise `REQUEST_DELAY` (e.g. `4`–`6`) and/or `EMPTY_RETRY`. Persistent zero results across all keywords usually means the cookie expired, not rate limiting — re-login per Troubleshooting.
 
+### Headless vs headed browser
+
+The image-search phase (Phase 2) and comment scraping use Playwright. In some runtimes the **headless** browser crashes (`TargetClosedError`) and image posts come back empty. Run with a **visible/local browser** instead — it is more stable and trips Douyin's anti-bot less:
+
+```bash
+python main.py scrape-to-bitable "关键词" --folder <folder> --headed
+# or for scrape_all.py: set DOUYIN_HEADLESS=0
+```
+
+Note: `--headed` improves **image search** stability but does **not** unblock **second-level (reply) comments** — the reply endpoint is guarded by `bd-ticket-guard` and returns empty regardless of headless/headed. First-level comments and video search work in both modes.
+
 ## Known Limitations
 
 1. **Play count** -- Always 0 from Web API. Douyin blocks this for all third-party tools.
