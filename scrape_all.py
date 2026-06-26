@@ -45,6 +45,48 @@ SKIP_COMMENTS = os.environ.get("SKIP_COMMENTS", "").lower() in ("1", "true", "ye
 # main.py sets this when creating/targeting a specific bitable.
 APP_TOKEN = os.environ.get("FEISHU_APP_TOKEN", "")
 
+# Engagement filter: keep a post only if its like / collect / comment counts
+# clear MIN_ENGAGEMENT (strictly greater). ENGAGEMENT_LOGIC 'or' = any metric
+# passes; 'and' = all must pass. MIN_ENGAGEMENT <= 0 disables the filter.
+MIN_ENGAGEMENT = int(os.environ.get("MIN_ENGAGEMENT", "0"))
+ENGAGEMENT_LOGIC = os.environ.get("ENGAGEMENT_LOGIC", "or").lower()
+# Cap on total posts kept (0 = no cap). Video/image are interleaved so both
+# types are represented up to the cap.
+MAX_POSTS = int(os.environ.get("MAX_POSTS_TOTAL", "0"))
+
+
+def _passes_engagement(post):
+    if MIN_ENGAGEMENT <= 0:
+        return True
+    checks = [
+        post.get('digg_count', 0) > MIN_ENGAGEMENT,
+        post.get('collect_count', 0) > MIN_ENGAGEMENT,
+        post.get('comment_count', 0) > MIN_ENGAGEMENT,
+    ]
+    return all(checks) if ENGAGEMENT_LOGIC == 'and' else any(checks)
+
+
+def _apply_engagement_and_cap(posts):
+    """Filter by engagement, then interleave video/image up to MAX_POSTS."""
+    kept = [p for p in posts if _passes_engagement(p)]
+    if MIN_ENGAGEMENT > 0:
+        print(f'[Engagement] kept {len(kept)}/{len(posts)} posts '
+              f'({ENGAGEMENT_LOGIC.upper()} like/collect/comment > {MIN_ENGAGEMENT})')
+    if not MAX_POSTS or len(kept) <= MAX_POSTS:
+        return kept
+    videos = [p for p in kept if p['type'] == 'video']
+    images = [p for p in kept if p['type'] == 'image']
+    out, i, j = [], 0, 0
+    while len(out) < MAX_POSTS and (i < len(videos) or j < len(images)):
+        if i < len(videos):
+            out.append(videos[i]); i += 1
+        if len(out) >= MAX_POSTS:
+            break
+        if j < len(images):
+            out.append(images[j]); j += 1
+    print(f'[Cap] limited to {len(out)} posts (max {MAX_POSTS}, video+image interleaved)')
+    return out
+
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
@@ -317,6 +359,11 @@ async def search_all_posts():
     image_count = sum(1 for p in all_posts if p['type'] == 'image')
     print(f'Total unique posts found: {len(all_posts)}')
     print(f'  Video: {len(all_posts) - image_count}, Image/Note: {image_count}')
+
+    # Apply engagement filter + total cap (interleave video/image).
+    all_posts = _apply_engagement_and_cap(all_posts)
+    kept_img = sum(1 for p in all_posts if p['type'] == 'image')
+    print(f'After filter/cap: {len(all_posts)} posts (video {len(all_posts) - kept_img}, image {kept_img})')
     return all_posts
 
 

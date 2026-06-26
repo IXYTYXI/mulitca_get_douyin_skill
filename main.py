@@ -210,9 +210,15 @@ def _folder_token(value: str) -> str:
               help="发布时间预设范围: 0=不限 1=一天内 7=一周内 182=半年内")
 @click.option("--start-date", help="自定义起始日期 (含当天) YYYY-MM-DD")
 @click.option("--end-date", help="自定义结束日期 (含当天) YYYY-MM-DD")
+@click.option("--min-engagement", type=int, default=0,
+              help="互动过滤阈值：点赞/收藏/评论需 > 此值（0=不过滤）")
+@click.option("--engagement-logic", type=click.Choice(["or", "and"]), default="or",
+              help="互动过滤的逻辑：or=任一指标达标，and=全部达标")
+@click.option("--max-posts", type=int, default=0, help="最多保留的作品总数（0=不限，视频+图文交替）")
 @click.option("--no-comments", is_flag=True, help="只抓作品(视频+图文)，跳过一/二级评论")
 @click.option("--structure-only", is_flag=True, help="只新建 4 张表结构，不抓数据")
-def scrape_to_bitable(keyword, folder, name, publish_time, start_date, end_date, no_comments, structure_only):
+def scrape_to_bitable(keyword, folder, name, publish_time, start_date, end_date,
+                      min_engagement, engagement_logic, max_posts, no_comments, structure_only):
     """新建标准 4 表多维表格(视频作品/图文作品/一级评论/二级评论)并跑完整流程写入。
 
     作品的封面/视频/图片以真实文件上传为附件；作品链接、作者主页为链接原文。
@@ -224,12 +230,15 @@ def scrape_to_bitable(keyword, folder, name, publish_time, start_date, end_date,
         raise click.UsageError(str(e))
     asyncio.run(_scrape_to_bitable(
         keyword, _folder_token(folder), name,
-        publish_time, start_date, end_date, no_comments, structure_only,
+        publish_time, start_date, end_date,
+        min_engagement, engagement_logic, max_posts, no_comments, structure_only,
     ))
 
 
 async def _scrape_to_bitable(keyword, folder_token, name,
-                             publish_time, start_date, end_date, no_comments, structure_only):
+                             publish_time, start_date, end_date,
+                             min_engagement, engagement_logic, max_posts,
+                             no_comments, structure_only):
     # 1. Create the canonical 4-table bitable
     feishu = FeishuBitable()
     try:
@@ -258,6 +267,9 @@ async def _scrape_to_bitable(keyword, folder_token, name,
         scrape_all.COMMENT_L2_TABLE_ID = ids["comment_l2_table_id"]
         scrape_all.DATE_FILTER = DateFilter.from_inputs(publish_time, start_date, end_date)
         scrape_all.SKIP_COMMENTS = no_comments
+        scrape_all.MIN_ENGAGEMENT = min_engagement
+        scrape_all.ENGAGEMENT_LOGIC = engagement_logic
+        scrape_all.MAX_POSTS = max_posts
         await scrape_all.main()
 
     click.echo("\n=== 多维表格已就绪 ===")
