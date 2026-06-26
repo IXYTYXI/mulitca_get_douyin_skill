@@ -3,6 +3,7 @@ from typing import List
 
 from core.client import DouyinClient
 from core.datefilter import DateFilter
+from core.throttle import fetch_json
 from config.settings import DOUYIN_API_BASE, MAX_PAGES, REQUEST_DELAY, DOUYIN_COOKIE
 from models.data import VideoInfo, UserInfo
 
@@ -64,8 +65,9 @@ class KeywordScraper:
             }
             date_filter.apply_search_params(params)
 
-            data = await self.client.get(
-                f"{DOUYIN_API_BASE}/search/item/", params=params
+            data = await fetch_json(
+                self.client, f"{DOUYIN_API_BASE}/search/item/", params,
+                item_keys=("data",), label=f"search p{page}",
             )
             if not data or data.get("status_code") != 0:
                 print(f"[Search] API error on page {page}: status={data.get('status_code')}")
@@ -73,6 +75,7 @@ class KeywordScraper:
 
             items = data.get("data", [])
             if not items:
+                # Empty even after backoff retries — treat as end of results.
                 break
 
             for item in items:
@@ -127,8 +130,9 @@ class KeywordScraper:
                 "pc_client_type": "1",
             }
 
-            data = await self.client.get(
-                f"{DOUYIN_API_BASE}/search/item/", params=params
+            data = await fetch_json(
+                self.client, f"{DOUYIN_API_BASE}/search/item/", params,
+                item_keys=("user_list", "data"), label=f"user-search p{page}",
             )
             if not data or data.get("status_code") != 0:
                 break

@@ -1,7 +1,8 @@
 import asyncio
 import httpx
 from typing import Optional
-from config.settings import DEFAULT_HEADERS, PROXY_URL, REQUEST_DELAY
+from config.settings import DEFAULT_HEADERS, PROXY_URL, REQUEST_DELAY, REQUEST_MAX_RETRIES
+from core.throttle import jittered_delay, backoff_delay
 
 
 class DouyinClient:
@@ -23,17 +24,20 @@ class DouyinClient:
         self._cookies = cookies
         self._client.headers["Cookie"] = cookies
 
-    async def get(self, url: str, params: Optional[dict] = None, retries: int = 3) -> dict:
+    async def get(self, url: str, params: Optional[dict] = None, retries: int = None) -> dict:
+        retries = REQUEST_MAX_RETRIES if retries is None else retries
         for attempt in range(retries):
             try:
-                await asyncio.sleep(self._delay)
+                # Jittered base delay before every call — avoids a robotic cadence.
+                await asyncio.sleep(jittered_delay(self._delay))
                 resp = await self._client.get(url, params=params)
                 resp.raise_for_status()
                 return resp.json()
             except (httpx.HTTPError, Exception) as e:
                 print(f"[Request error] attempt {attempt + 1}/{retries}: {e}")
                 if attempt < retries - 1:
-                    await asyncio.sleep(self._delay * (attempt + 1))
+                    # Exponential backoff with jitter between transport retries.
+                    await asyncio.sleep(backoff_delay(attempt + 1, self._delay))
         return {}
 
     async def close(self):

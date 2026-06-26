@@ -16,6 +16,13 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2"))
 
+# Anti-throttle pacing (see core/throttle.py)
+REQUEST_JITTER = float(os.getenv("REQUEST_JITTER", "0.4"))    # ±fraction of REQUEST_DELAY
+REQUEST_MAX_RETRIES = int(os.getenv("REQUEST_MAX_RETRIES", "3"))  # transport-error retries
+BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "2.0"))    # exponential growth per retry
+BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", "30"))          # cap on a single backoff (s)
+EMPTY_RETRY = int(os.getenv("EMPTY_RETRY", "2"))             # retries on empty/blocked page
+
 DOUYIN_BASE_URL = "https://www.douyin.com"
 DOUYIN_API_BASE = "https://www.douyin.com/aweme/v1/web"
 

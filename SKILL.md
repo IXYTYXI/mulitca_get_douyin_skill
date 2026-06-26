@@ -156,13 +156,34 @@ python main.py trending                       # Trending videos
 python main.py video VIDEO_ID --comments     # Single video details + comments
 ```
 
+## Rate Limiting & Delay Strategy
+
+Douyin throttles requests that are too fast **or too regular**. When it triggers, the search endpoints usually still return HTTP 200 but with `status_code == 0` and an **empty `data` array** — which a naive scraper misreads as "no more results" and stops early. The scraper guards against this in `core/throttle.py`:
+
+- **Jittered delays** — every request waits `REQUEST_DELAY` ± `REQUEST_JITTER` (randomized), so the cadence isn't a fixed robotic beat.
+- **Exponential backoff** — transport errors retry with growing waits (`BACKOFF_FACTOR`, capped at `BACKOFF_MAX`).
+- **Empty/blocked retry** — an unexpectedly empty page is treated as a throttle signal and retried up to `EMPTY_RETRY` times with backoff before giving up. Applied to the HTTP search (Phase 1), the browser image search (Phase 2), and keyword search.
+
+Tuning knobs (env / `.env`, defaults shown):
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `REQUEST_DELAY` | `2` | Base seconds between requests |
+| `REQUEST_JITTER` | `0.4` | Random ± fraction of the base delay |
+| `EMPTY_RETRY` | `2` | Retries on an empty/blocked page |
+| `REQUEST_MAX_RETRIES` | `3` | Retries on transport errors |
+| `BACKOFF_FACTOR` | `2.0` | Exponential growth per retry |
+| `BACKOFF_MAX` | `30` | Cap on a single backoff (s) |
+
+If you still see frequent empty results, raise `REQUEST_DELAY` (e.g. `4`–`6`) and/or `EMPTY_RETRY`. Persistent zero results across all keywords usually means the cookie expired, not rate limiting — re-login per Troubleshooting.
+
 ## Known Limitations
 
 1. **Play count** -- Always 0 from Web API. Douyin blocks this for all third-party tools.
 2. **Reply comments** -- Only first-level comments are reliably scrapeable. The reply API has stricter security.
 3. **Image posts in search** -- Some keywords return no image posts even through the browser API. This is Douyin backend behavior (App and Web results differ).
 4. **Cookie expiration** -- Cookies expire after ~60 days. If auth errors occur, re-login and update the cookie.
-5. **Rate limiting** -- Default 2-second delay between API requests. Headless browser may trigger verification.
+5. **Rate limiting** -- Requests are paced with a jittered delay + exponential backoff and empty-page retries (see "Rate Limiting & Delay Strategy"). Tune via `REQUEST_DELAY` / `REQUEST_JITTER` / `EMPTY_RETRY`. Headless browser may still trigger verification.
 
 ## Troubleshooting
 

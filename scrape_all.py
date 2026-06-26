@@ -16,7 +16,8 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright
 from core.client import DouyinClient
 from core.datefilter import DateFilter
-from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY
+from core.throttle import fetch_json, polite_sleep, jittered_delay, backoff_delay
+from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY, EMPTY_RETRY
 from storage.feishu import FeishuBitable
 from storage.downloader import download_file, download_video_media, cleanup_downloads, DOWNLOAD_DIR
 
@@ -123,19 +124,31 @@ async def _browser_search_images(keyword, seen_ids, date_filter=None):
                     f'&search_source=tab_search&query_correct_type=1{filter_suffix}'
                     f'&offset={offset}&count=20&cookie_enabled=true&platform=PC'
                 )
-                data = await asyncio.wait_for(page.evaluate(
-                    """async (url) => {
-                        try {
-                            const resp = await fetch(url, {
-                                headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
-                                credentials: 'include',
-                            });
-                            return await resp.json();
-                        } catch (e) {
-                            return {status_code: -1, error: e.message};
-                        }
-                    }""", url
-                ), timeout=30)
+                # Fetch this page, retrying empty/blocked responses with backoff
+                # (the browser API throttles the same way the HTTP one does).
+                data = None
+                for att in range(EMPTY_RETRY + 1):
+                    data = await asyncio.wait_for(page.evaluate(
+                        """async (url) => {
+                            try {
+                                const resp = await fetch(url, {
+                                    headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
+                                    credentials: 'include',
+                                });
+                                return await resp.json();
+                            } catch (e) {
+                                return {status_code: -1, error: e.message};
+                            }
+                        }""", url
+                    ), timeout=30)
+                    if data and data.get('status_code') == 0 and data.get('data'):
+                        break
+                    if att < EMPTY_RETRY:
+                        d = backoff_delay(att + 1)
+                        sc = data.get('status_code') if data else None
+                        print(f'  [throttle?] image off{offset} empty/blocked (status={sc}); '
+                              f'backoff {d:.1f}s, retry {att + 1}/{EMPTY_RETRY}')
+                        await asyncio.sleep(d)
 
                 if not data or data.get('status_code') != 0:
                     break
@@ -168,7 +181,7 @@ async def _browser_search_images(keyword, seen_ids, date_filter=None):
                         results.append(parse_post(aweme))
                 if new_count == 0 or not data.get('has_more', 0):
                     break
-                await asyncio.sleep(3)
+                await asyncio.sleep(jittered_delay(3))
 
             # Fetch details for image posts missing image URLs
             for aid in detail_ids:
@@ -254,7 +267,10 @@ async def search_all_posts():
                     'platform': 'PC',
                 }
                 DATE_FILTER.apply_search_params(params)
-                data = await client.get(f'{DOUYIN_API_BASE}/search/item/', params=params)
+                data = await fetch_json(
+                    client, f'{DOUYIN_API_BASE}/search/item/', params,
+                    item_keys=('data',), label=f'{channel} off{offset}',
+                )
                 if not data or data.get('status_code') != 0:
                     break
                 items = data.get('data', [])
@@ -277,7 +293,7 @@ async def search_all_posts():
                     break
                 if not data.get('has_more', 0):
                     break
-                await asyncio.sleep(REQUEST_DELAY)
+                await polite_sleep()
 
     video_count = len(all_posts)
     if DATE_FILTER.has_custom_range:
@@ -533,7 +549,7 @@ async def fetch_comments_for_posts(posts):
             if not data.get('has_more', 0):
                 break
             cursor = data.get('cursor', 0)
-            await asyncio.sleep(REQUEST_DELAY)
+            await polite_sleep()
 
         print(f'    Got {video_comments} comments')
 
