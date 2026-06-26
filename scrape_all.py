@@ -75,6 +75,11 @@ HEADLESS = os.environ.get("DOUYIN_HEADLESS", "1").lower() not in ("0", "false", 
 # instead of the raw reply API. This is how second-level replies are obtained,
 # since the reply API is bd-ticket-guard'd. Requires a headed browser.
 USE_UI_COMMENTS = os.environ.get("USE_UI_COMMENTS", "").lower() in ("1", "true", "yes")
+
+# Append to existing tables instead of clearing them first (for adding another
+# keyword's data into the same bitable). Records carry 搜索关键词 so they stay
+# distinguishable.
+APPEND = os.environ.get("APPEND", "").lower() in ("1", "true", "yes")
 L2_REPLY_TIMEOUT = int(os.environ.get("L2_REPLY_TIMEOUT", "8"))   # seconds per reply fetch
 L2_DRY_GIVEUP = int(os.environ.get("L2_DRY_GIVEUP", "3"))         # consecutive empty fetches -> stop L2 for this post
 
@@ -777,9 +782,12 @@ async def main():
     print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
     feishu = FeishuBitable(app_token=APP_TOKEN)
 
-    # Clear old records in both tables
-    feishu.delete_all_records(VIDEO_TABLE_ID)
-    feishu.delete_all_records(IMAGE_TABLE_ID)
+    # Clear old records in both tables (unless appending another keyword)
+    if not APPEND:
+        feishu.delete_all_records(VIDEO_TABLE_ID)
+        feishu.delete_all_records(IMAGE_TABLE_ID)
+    else:
+        print('  [APPEND] keeping existing records in video/image tables')
 
     video_records = []
     image_records = []
@@ -819,11 +827,13 @@ async def main():
         print('\n=== Step 4: Write comments to Feishu (separate tables) ===')
         feishu = FeishuBitable(app_token=APP_TOKEN)
         if l1_records:
-            feishu.delete_all_records(COMMENT_L1_TABLE_ID)
+            if not APPEND:
+                feishu.delete_all_records(COMMENT_L1_TABLE_ID)
             w1 = feishu.write_records(l1_records, COMMENT_L1_TABLE_ID)
             print(f'Written {w1} 一级评论 records')
         if l2_records:
-            feishu.delete_all_records(COMMENT_L2_TABLE_ID)
+            if not APPEND:
+                feishu.delete_all_records(COMMENT_L2_TABLE_ID)
             w2 = feishu.write_records(l2_records, COMMENT_L2_TABLE_ID)
             print(f'Written {w2} 二级评论 records')
         feishu.close()
