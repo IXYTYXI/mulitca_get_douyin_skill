@@ -1,13 +1,14 @@
 import asyncio
 import sys
 import os
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import click
 
 from core.client import DouyinClient
-from core.browser import DouyinBrowser
+from core.browser import DouyinBrowser, COOKIE_FILE
 from scrapers.keyword import KeywordScraper
 from scrapers.user import UserScraper
 from scrapers.video import VideoScraper
@@ -30,28 +31,100 @@ def cli():
     pass
 
 
+def _save_cookie_to_env(cookie_str: str):
+    """Write/replace DOUYIN_COOKIE in the .env file (preserving other keys)."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    out, done = [], False
+    for ln in lines:
+        if ln.startswith("DOUYIN_COOKIE="):
+            out.append("DOUYIN_COOKIE=" + cookie_str)
+            done = True
+        else:
+            out.append(ln)
+    if not done:
+        out.append("DOUYIN_COOKIE=" + cookie_str)
+    with open(env_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
+
+
 @cli.command()
-def login():
-    """打开浏览器登录抖音，保存 Cookie 供后续爬取使用"""
-    asyncio.run(_login())
+@click.option("--timeout", default=480, help="等待登录的最长秒数（默认 480=8分钟）")
+def login(timeout):
+    """打开可见浏览器登录抖音，自动检测登录并保存 Cookie（无需手动按回车）。"""
+    asyncio.run(_login(timeout))
 
 
-async def _login():
-    browser = DouyinBrowser()
-    await browser.start(headless=False)
-    click.echo("浏览器已打开，请在浏览器中：")
-    click.echo("  1. 登录你的抖音账号")
-    click.echo("  2. 如果出现验证码，请手动完成验证")
-    click.echo("  3. 登录成功后，尝试搜索一个关键词确认正常")
-    click.echo("  4. 完成后回到终端按回车键保存 Cookie\n")
+async def _login(timeout=480):
+    import time as _t
+    from playwright.async_api import async_playwright
+    from core.browser import STEALTH_JS
+    try:
+        sys.stdout.reconfigure(errors="replace")  # avoid GBK console encode crashes
+    except Exception:
+        pass
 
-    await browser.navigate("https://www.douyin.com")
+    pw = await async_playwright().start()
+    br = await pw.chromium.launch(
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    )
+    ctx = await br.new_context(
+        viewport={"width": 1440, "height": 900},
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+        locale="zh-CN", timezone_id="Asia/Shanghai",
+    )
+    await ctx.add_init_script(STEALTH_JS)
+    page = await ctx.new_page()
+    try:
+        await page.goto("https://www.douyin.com", wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        pass
 
-    input("按回车键保存 Cookie 并关闭浏览器...")
+    click.echo("浏览器已打开。请在窗口里登录抖音（扫码或手机号），并完成任何滑块/验证码。")
+    click.echo(f"检测到登录后会自动保存 Cookie；最多等待 {timeout} 秒。")
 
-    await browser.save_cookies()
-    await browser.close()
-    click.echo("\nCookie 已保存！后续爬取将自动使用这些 Cookie。")
+    def cookie_str(cookies):
+        return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+    def is_logged_in(cookies):
+        by = {c["name"]: c["value"] for c in cookies}
+        has_session = len(by.get("sessionid_ss", "")) > 10 or len(by.get("sessionid", "")) > 10
+        return has_session and ("sid_guard" in by or "uid_tt" in by)
+
+    start = _t.time()
+    logged_in = False
+    last_str = ""
+    while _t.time() - start < timeout:
+        await asyncio.sleep(5)
+        cookies = await ctx.cookies()
+        last_str = cookie_str(cookies)
+        # Persist continuously so progress is never lost.
+        if last_str:
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            _save_cookie_to_env(last_str)
+        if is_logged_in(cookies):
+            logged_in = True
+            # give the page a moment to settle, capture once more, then stop
+            await asyncio.sleep(3)
+            cookies = await ctx.cookies()
+            last_str = cookie_str(cookies)
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            _save_cookie_to_env(last_str)
+            break
+
+    await br.close()
+    await pw.stop()
+    if logged_in:
+        click.echo(f"\n✅ 检测到登录，Cookie 已保存（{len(last_str)} 字符）到 .env 和 cookies.json。")
+    else:
+        click.echo("\n⚠️ 超时未检测到登录。若你已登录但未识别，Cookie 也已尽量保存；否则请重试。")
 
 
 @cli.command()
