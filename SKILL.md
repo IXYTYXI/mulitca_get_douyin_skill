@@ -8,6 +8,41 @@ user-invocable: true
 
 Use this skill when the user wants to scrape data from Douyin -- keyword search results, author profile posts, video details, comments, or trending topics -- and write the results to Feishu bitable.
 
+## Feishu Data Model — CANONICAL (do not deviate)
+
+These are standing requirements from the project owner. **Always follow them when writing to Feishu; do not collapse or relabel.**
+
+1. **Four separate tables** — never merge:
+   | 表 | 内容 |
+   |---|---|
+   | **视频作品** | video posts only |
+   | **图文作品** | image/note posts only |
+   | **一级评论** | first-level comments |
+   | **二级评论** | second-level (reply) comments |
+2. **Upload the actual media files** (not just URLs) as Feishu **attachments**:
+   - 视频作品: `作品封面` (cover) + `作品视频` (the real .mp4) — both attachments.
+   - 图文作品: `作品封面` + `作品图片` (all images) — attachments.
+3. **Link fields show the raw URL**, not a label. `作品链接` and `作者主页` (and `主页链接`) are URL fields whose displayed text **is the URL itself** — never "作品链接" / "查看作品" / a nickname. Build them with `storage.feishu.url_field(url)` → `{"link": url, "text": url}`.
+4. **二级评论** carries `父评论ID` (the L1 comment it replies to) and `回复对象` (who it replies to).
+
+The field schemas live in `storage/feishu.py` (`setup_video_table` / `setup_image_table` / `setup_comment_l1_table` / `setup_comment_l2_table`); attachment fields are type 17, URL fields type 15.
+
+### How to produce it
+
+```bash
+# One shot: create the standard 4-table bitable in a folder AND run the full
+# pipeline (posts split video/image with media uploaded + L1/L2 comments).
+python main.py scrape-to-bitable "关键词" --folder <folder_token_or_url>
+
+# Just create the 4-table structure (no scraping):
+python main.py scrape-to-bitable "关键词" --folder <folder> --structure-only
+
+# Skip comments (posts only):
+python main.py scrape-to-bitable "关键词" --folder <folder> --no-comments
+```
+
+Reuse an existing bitable by setting `FEISHU_APP_TOKEN` + `VIDEO_TABLE_ID` / `IMAGE_TABLE_ID` / `COMMENT_L1_TABLE_ID` / `COMMENT_L2_TABLE_ID` in `.env`, then run `python scrape_all.py`.
+
 ## First-Run Setup
 
 The scraper code ships as supporting files with this skill. On first use, the agent must set up the environment:

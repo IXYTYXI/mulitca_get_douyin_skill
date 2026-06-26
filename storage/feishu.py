@@ -89,6 +89,46 @@ class FeishuBitable:
         )
         return resp.json().get("code") == 0
 
+    def create_full_bitable(self, name: str, folder_token: str = "") -> dict:
+        """Create the canonical 4-table Douyin bitable and return all IDs.
+
+        Tables: 视频作品 / 图文作品 / 一级评论 / 二级评论 (see SKILL.md data model).
+        The auto-created default empty table is removed. Returns:
+        {app_token, url, video_table_id, image_table_id,
+         comment_l1_table_id, comment_l2_table_id}
+        """
+        app = self.create_app(name, folder_token)
+        app_token = app["app_token"]
+        default_table_id = app.get("default_table_id", "")
+
+        video_tid = self.create_table("视频作品")
+        self.setup_video_table(video_tid)
+        image_tid = self.create_table("图文作品")
+        self.setup_image_table(image_tid)
+        l1_tid = self.create_table("一级评论")
+        self.setup_comment_l1_table(l1_tid)
+        l2_tid = self.create_table("二级评论")
+        self.setup_comment_l2_table(l2_tid)
+
+        # Remove the empty default table Feishu auto-creates.
+        if default_table_id:
+            try:
+                self._client.delete(
+                    f"{FEISHU_API_BASE}/bitable/v1/apps/{app_token}/tables/{default_table_id}",
+                    headers=self._headers(),
+                )
+            except Exception:
+                pass
+
+        return {
+            "app_token": app_token,
+            "url": app.get("url", f"https://feishu.cn/base/{app_token}"),
+            "video_table_id": video_tid,
+            "image_table_id": image_tid,
+            "comment_l1_table_id": l1_tid,
+            "comment_l2_table_id": l2_tid,
+        }
+
     def list_tables(self) -> list:
         """List all tables in the Bitable app."""
         url = f"{FEISHU_API_BASE}/bitable/v1/apps/{self.app_token}/tables"
@@ -162,23 +202,44 @@ class FeishuBitable:
         print(f"[Feishu] Written {total_written}/{len(records)} records to table {tid}")
         return total_written
 
+    # Field types: 1=text 2=number 3=select 5=datetime 7=checkbox 15=url 17=attachment
     def setup_video_table(self, table_id: str = "") -> None:
-        """Create fields for the video data table."""
+        """Fields for the VIDEO posts table — cover & video are real attachments."""
         fields = [
             {"field_name": "作者", "type": 1},
             {"field_name": "作品正文", "type": 1},
-            {"field_name": "作品链接", "type": 15},
-            {"field_name": "作品封面", "type": 15},
-            {"field_name": "作品图片", "type": 1},
-            {"field_name": "作品视频", "type": 15},
+            {"field_name": "作品链接", "type": 15},      # raw URL (link == text)
+            {"field_name": "作者主页", "type": 15},      # raw URL (link == text)
+            {"field_name": "作品封面", "type": 17},      # attachment (uploaded file)
+            {"field_name": "作品视频", "type": 17},      # attachment (uploaded file)
             {"field_name": "点赞数", "type": 2},
             {"field_name": "评论数", "type": 2},
             {"field_name": "收藏数", "type": 2},
             {"field_name": "分享数", "type": 2},
-            {"field_name": "播放量", "type": 2},
             {"field_name": "发布时间", "type": 1},
             {"field_name": "话题标签", "type": 1},
-            {"field_name": "作者主页", "type": 15},
+            {"field_name": "搜索关键词", "type": 1},
+            {"field_name": "爬取时间", "type": 1},
+        ]
+        self.add_fields(fields, table_id)
+
+    def setup_image_table(self, table_id: str = "") -> None:
+        """Fields for the IMAGE/note posts table — cover & images are attachments."""
+        fields = [
+            {"field_name": "作者", "type": 1},
+            {"field_name": "作品正文", "type": 1},
+            {"field_name": "作品链接", "type": 15},      # raw URL
+            {"field_name": "作者主页", "type": 15},      # raw URL
+            {"field_name": "作品封面", "type": 17},      # attachment
+            {"field_name": "作品图片", "type": 17},      # attachment (multiple files)
+            {"field_name": "点赞数", "type": 2},
+            {"field_name": "评论数", "type": 2},
+            {"field_name": "收藏数", "type": 2},
+            {"field_name": "分享数", "type": 2},
+            {"field_name": "发布时间", "type": 1},
+            {"field_name": "话题标签", "type": 1},
+            {"field_name": "搜索关键词", "type": 1},
+            {"field_name": "爬取时间", "type": 1},
         ]
         self.add_fields(fields, table_id)
 
@@ -196,19 +257,43 @@ class FeishuBitable:
         ]
         self.add_fields(fields, table_id)
 
-    def setup_comment_table(self, table_id: str = "") -> None:
-        """Create fields for the comment data table."""
+    def setup_comment_l1_table(self, table_id: str = "") -> None:
+        """Fields for the FIRST-level (一级评论) comment table."""
         fields = [
             {"field_name": "评论ID", "type": 1},
-            {"field_name": "视频ID", "type": 1},
             {"field_name": "评论内容", "type": 1},
-            {"field_name": "用户昵称", "type": 1},
-            {"field_name": "用户ID", "type": 1},
+            {"field_name": "评论者昵称", "type": 1},
+            {"field_name": "评论者ID", "type": 1},
+            {"field_name": "所属作品ID", "type": 1},
+            {"field_name": "所属作品描述", "type": 1},
             {"field_name": "点赞数", "type": 2},
             {"field_name": "回复数", "type": 2},
-            {"field_name": "发布时间", "type": 1},
+            {"field_name": "评论时间", "type": 1},
+            {"field_name": "搜索关键词", "type": 1},
+            {"field_name": "爬取时间", "type": 1},
         ]
         self.add_fields(fields, table_id)
+
+    def setup_comment_l2_table(self, table_id: str = "") -> None:
+        """Fields for the SECOND-level (二级评论 / reply) comment table."""
+        fields = [
+            {"field_name": "评论ID", "type": 1},
+            {"field_name": "评论内容", "type": 1},
+            {"field_name": "评论者昵称", "type": 1},
+            {"field_name": "评论者ID", "type": 1},
+            {"field_name": "父评论ID", "type": 1},
+            {"field_name": "回复对象", "type": 1},
+            {"field_name": "所属作品ID", "type": 1},
+            {"field_name": "点赞数", "type": 2},
+            {"field_name": "评论时间", "type": 1},
+            {"field_name": "搜索关键词", "type": 1},
+            {"field_name": "爬取时间", "type": 1},
+        ]
+        self.add_fields(fields, table_id)
+
+    # Backwards-compatible alias (old name)
+    def setup_comment_table(self, table_id: str = "") -> None:
+        self.setup_comment_l1_table(table_id)
 
     def setup_trending_table(self, table_id: str = "") -> None:
         """Create fields for the trending data table."""
@@ -333,23 +418,34 @@ class FeishuBitable:
         return data.get("data", {}).get("file_token", "")
 
 
+def url_field(url: str):
+    """Value for a Feishu URL field that DISPLAYS the raw link (link == text).
+
+    Per the data-model agreement, link fields (作品链接 / 作者主页 / 主页链接) must
+    show the URL itself, NOT a label like '查看作品'. Empty url -> "".
+    """
+    return {"link": url, "text": url} if url else ""
+
+
 def video_to_feishu_record(video) -> dict:
+    """Lightweight record (no media upload) for the quick `search` path.
+
+    Links are raw URLs. The canonical full pipeline with real attachments is
+    scrape_all.py / scrape-to-bitable — see SKILL.md "Feishu Data Model".
+    """
     author_sec_uid = getattr(video, "author_sec_uid", "")
+    homepage = f"https://www.douyin.com/user/{author_sec_uid}" if author_sec_uid else ""
     return {
         "作者": video.author_nickname,
         "作品正文": video.desc,
-        "作品链接": {"link": video.post_url, "text": "查看作品"} if video.post_url else "",
-        "作品封面": {"link": video.cover_url, "text": "封面"} if video.cover_url else "",
-        "作品图片": video.image_urls if video.image_urls else "",
-        "作品视频": {"link": video.video_url, "text": "播放视频"} if video.video_url else "",
+        "作品链接": url_field(video.post_url),
+        "作者主页": url_field(homepage),
         "点赞数": video.digg_count,
         "评论数": video.comment_count,
         "收藏数": video.collect_count,
         "分享数": video.share_count,
-        "播放量": video.play_count,
         "发布时间": video.create_time,
         "话题标签": video.hashtags,
-        "作者主页": {"link": f"https://www.douyin.com/user/{author_sec_uid}", "text": video.author_nickname} if author_sec_uid else "",
     }
 
 
@@ -362,7 +458,7 @@ def user_to_feishu_record(user) -> dict:
         "关注数": user.following_count,
         "获赞数": user.total_favorited,
         "作品数": user.aweme_count,
-        "主页链接": {"link": user.homepage_url, "text": user.nickname} if user.homepage_url else "",
+        "主页链接": url_field(user.homepage_url),
     }
 
 

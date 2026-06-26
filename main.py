@@ -206,31 +206,34 @@ def _folder_token(value: str) -> str:
 @click.argument("keyword")
 @click.option("--folder", help="飞书文件夹 token 或 URL（新建多维表格的位置；留空建在应用空间）")
 @click.option("--name", default="抖音作品数据", help="新建多维表格的名称")
-@click.option("--max-count", "-n", default=50, help="最大爬取数量")
-@click.option("--sort", "-s", type=click.Choice(["综合", "最新", "最热"]), default="综合")
 @click.option("--publish-time", type=click.Choice(["0", "1", "7", "182"]), default="0",
               help="发布时间预设范围: 0=不限 1=一天内 7=一周内 182=半年内")
 @click.option("--start-date", help="自定义起始日期 (含当天) YYYY-MM-DD")
 @click.option("--end-date", help="自定义结束日期 (含当天) YYYY-MM-DD")
-def scrape_to_bitable(keyword, folder, name, max_count, sort, publish_time, start_date, end_date):
-    """新建一个飞书多维表格，爬取关键词数据并写入（之后可复用该表）。"""
-    sort_map = {"综合": 0, "最新": 1, "最热": 2}
+@click.option("--no-comments", is_flag=True, help="只抓作品(视频+图文)，跳过一/二级评论")
+@click.option("--structure-only", is_flag=True, help="只新建 4 张表结构，不抓数据")
+def scrape_to_bitable(keyword, folder, name, publish_time, start_date, end_date, no_comments, structure_only):
+    """新建标准 4 表多维表格(视频作品/图文作品/一级评论/二级评论)并跑完整流程写入。
+
+    作品的封面/视频/图片以真实文件上传为附件；作品链接、作者主页为链接原文。
+    建好后可复用：在 .env 设置返回的 app_token 与各 table_id。
+    """
     try:
         DateFilter.from_inputs(publish_time, start_date, end_date)
     except ValueError as e:
         raise click.UsageError(str(e))
     asyncio.run(_scrape_to_bitable(
-        keyword, _folder_token(folder), name, max_count, sort_map[sort],
-        publish_time, start_date, end_date,
+        keyword, _folder_token(folder), name,
+        publish_time, start_date, end_date, no_comments, structure_only,
     ))
 
 
-async def _scrape_to_bitable(keyword, folder_token, name, max_count, sort_type,
-                             publish_time, start_date, end_date):
-    # 1. Create the bitable + a video table with the right fields
+async def _scrape_to_bitable(keyword, folder_token, name,
+                             publish_time, start_date, end_date, no_comments, structure_only):
+    # 1. Create the canonical 4-table bitable
     feishu = FeishuBitable()
     try:
-        app = feishu.create_app(name, folder_token)
+        ids = feishu.create_full_bitable(name, folder_token)
     except RuntimeError as e:
         msg = str(e)
         click.echo(f"新建多维表格失败: {msg}")
@@ -240,43 +243,48 @@ async def _scrape_to_bitable(keyword, folder_token, name, max_count, sort_type,
             click.echo("并确认应用已开通 drive:drive (云空间) 与 bitable:app 权限且已发布版本。")
         feishu.close()
         return
-    app_token = app["app_token"]
-    app_url = app.get("url", f"https://feishu.cn/base/{app_token}")
-    table_id = feishu.create_table("抖音作品数据")
-    feishu.setup_video_table(table_id)
-
-    # 2. Scrape
-    results = []
-    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
-        scraper = KeywordScraper(client)
-        results = await scraper.search_videos(
-            keyword, max_count, sort_type,
-            publish_time=publish_time, start_date=start_date, end_date=end_date,
-        )
-
-    # 3. Write
-    records = [video_to_feishu_record(v) for v in results]
-    written = feishu.write_records(records, table_id) if records else 0
     feishu.close()
 
-    click.echo("\n=== 完成 ===")
-    click.echo(f"多维表格: {app_url}")
-    click.echo(f"app_token: {app_token}")
-    click.echo(f"table_id : {table_id}")
-    click.echo(f"写入记录 : {written}/{len(records)}")
-    click.echo(f"复用方法 : 在 .env 设置 FEISHU_APP_TOKEN={app_token}，后续命令即可写入这张表。")
+    # 2. Run the full pipeline into those tables (unless structure-only).
+    #    scrape_all reads its table ids / keyword / filter from module globals
+    #    at call time, so we set them before invoking its main().
+    if not structure_only:
+        import scrape_all
+        scrape_all.APP_TOKEN = ids["app_token"]
+        scrape_all.KEYWORD = keyword
+        scrape_all.VIDEO_TABLE_ID = ids["video_table_id"]
+        scrape_all.IMAGE_TABLE_ID = ids["image_table_id"]
+        scrape_all.COMMENT_L1_TABLE_ID = ids["comment_l1_table_id"]
+        scrape_all.COMMENT_L2_TABLE_ID = ids["comment_l2_table_id"]
+        scrape_all.DATE_FILTER = DateFilter.from_inputs(publish_time, start_date, end_date)
+        scrape_all.SKIP_COMMENTS = no_comments
+        await scrape_all.main()
+
+    click.echo("\n=== 多维表格已就绪 ===")
+    click.echo(f"链接      : {ids['url']}")
+    click.echo(f"app_token : {ids['app_token']}")
+    click.echo(f"视频作品  : {ids['video_table_id']}")
+    click.echo(f"图文作品  : {ids['image_table_id']}")
+    click.echo(f"一级评论  : {ids['comment_l1_table_id']}")
+    click.echo(f"二级评论  : {ids['comment_l2_table_id']}")
+    click.echo("复用方法  : 在 .env 设置 FEISHU_APP_TOKEN / VIDEO_TABLE_ID / IMAGE_TABLE_ID / "
+               "COMMENT_L1_TABLE_ID / COMMENT_L2_TABLE_ID 为以上值。")
 
 
 @cli.command()
-@click.option("--type", "table_type", type=click.Choice(["video", "user", "comment", "trending"]), required=True)
+@click.option("--type", "table_type",
+              type=click.Choice(["video", "image", "comment-l1", "comment-l2", "user", "trending"]),
+              required=True)
 @click.option("--table-id", required=True, help="飞书表格 table_id")
 def setup_feishu(table_type, table_id):
     """初始化飞书多维表格的字段结构"""
     feishu = FeishuBitable()
     setup_map = {
         "video": feishu.setup_video_table,
+        "image": feishu.setup_image_table,
+        "comment-l1": feishu.setup_comment_l1_table,
+        "comment-l2": feishu.setup_comment_l2_table,
         "user": feishu.setup_user_table,
-        "comment": feishu.setup_comment_table,
         "trending": feishu.setup_trending_table,
     }
     setup_map[table_type](table_id)

@@ -18,12 +18,14 @@ from core.client import DouyinClient
 from core.datefilter import DateFilter
 from core.throttle import fetch_json, polite_sleep, jittered_delay, backoff_delay
 from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY, EMPTY_RETRY
-from storage.feishu import FeishuBitable
+from storage.feishu import FeishuBitable, url_field
 from storage.downloader import download_file, download_video_media, cleanup_downloads, DOWNLOAD_DIR
 
 VIDEO_TABLE_ID = os.environ.get("VIDEO_TABLE_ID", "YOUR_VIDEO_TABLE_ID")
 IMAGE_TABLE_ID = os.environ.get("IMAGE_TABLE_ID", "YOUR_IMAGE_TABLE_ID")
-COMMENT_TABLE_ID = os.environ.get("COMMENT_TABLE_ID", "YOUR_COMMENT_TABLE_ID")
+# First-level / second-level comment tables (COMMENT_TABLE_ID kept as L1 fallback)
+COMMENT_L1_TABLE_ID = os.environ.get("COMMENT_L1_TABLE_ID") or os.environ.get("COMMENT_TABLE_ID", "YOUR_COMMENT_L1_TABLE_ID")
+COMMENT_L2_TABLE_ID = os.environ.get("COMMENT_L2_TABLE_ID", "YOUR_COMMENT_L2_TABLE_ID")
 KEYWORD = os.environ.get("DOUYIN_KEYWORD", "YOUR_KEYWORD")
 
 # Date / time-range filter, configured via environment variables:
@@ -35,6 +37,13 @@ DATE_FILTER = DateFilter.from_inputs(
     os.environ.get("DOUYIN_START_DATE") or None,
     os.environ.get("DOUYIN_END_DATE") or None,
 )
+
+# Set True (e.g. by main.py) to skip the comment scraping step.
+SKIP_COMMENTS = os.environ.get("SKIP_COMMENTS", "").lower() in ("1", "true", "yes")
+
+# Bitable app_token to write into (empty -> use FEISHU_APP_TOKEN from .env).
+# main.py sets this when creating/targeting a specific bitable.
+APP_TOKEN = os.environ.get("FEISHU_APP_TOKEN", "")
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -422,8 +431,8 @@ def build_record(post, tokens):
     record = {
         '作者': post['author_nickname'],
         '作品正文': post['desc'],
-        '作品链接': post['post_url'],
-        '作者主页': post['author_homepage'],
+        '作品链接': url_field(post['post_url']),
+        '作者主页': url_field(post['author_homepage']),
         '点赞数': post['digg_count'],
         '评论数': post['comment_count'],
         '收藏数': post['collect_count'],
@@ -445,8 +454,77 @@ def build_record(post, tokens):
     return record
 
 
+async def _browser_get_json(page, url, timeout=30):
+    """Run a credentialed fetch inside the browser page and return parsed JSON."""
+    try:
+        return await asyncio.wait_for(page.evaluate(
+            """async (url) => {
+                try {
+                    const resp = await fetch(url, {
+                        headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
+                        credentials: 'include',
+                    });
+                    return await resp.json();
+                } catch (e) { return {status_code: -1, error: e.message}; }
+            }""", url
+        ), timeout=timeout)
+    except Exception:
+        return {}
+
+
+async def _fetch_replies(page, aweme_id, comment_id, parent_text_user, max_replies=50):
+    """Fetch second-level (reply) comments for one first-level comment."""
+    out = []
+    cursor = 0
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    while len(out) < max_replies:
+        url = (
+            f'{DOUYIN_API_BASE}/comment/list/reply/'
+            f'?item_id={aweme_id}&comment_id={comment_id}'
+            f'&cursor={cursor}&count=20&item_type=0'
+            f'&device_platform=webapp&aid=6383&cookie_enabled=true&platform=PC'
+        )
+        data = await _browser_get_json(page, url)
+        if not data or data.get('status_code') != 0:
+            break
+        replies = data.get('comments') or []
+        if not replies:
+            break
+        for r in replies:
+            user = r.get('user', {})
+            ct = r.get('create_time', 0)
+            # reply target: explicit reply_to user if present, else the L1 author
+            reply_to = ''
+            rt = r.get('reply_to_username') or (r.get('reply_to_reply') or {}).get('user', {}).get('nickname', '')
+            reply_to = rt or parent_text_user
+            out.append({
+                '评论ID': r.get('cid', ''),
+                '评论内容': r.get('text', ''),
+                '评论者昵称': user.get('nickname', ''),
+                '评论者ID': user.get('uid', ''),
+                '父评论ID': comment_id,
+                '回复对象': reply_to,
+                '所属作品ID': aweme_id,
+                '点赞数': r.get('digg_count', 0),
+                '评论时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ct)) if ct else '',
+                '搜索关键词': KEYWORD,
+                '爬取时间': now,
+            })
+            if len(out) >= max_replies:
+                break
+        if not data.get('has_more', 0):
+            break
+        cursor = data.get('cursor', 0)
+        await polite_sleep()
+    return out
+
+
 async def fetch_comments_for_posts(posts):
-    """Fetch first-level comments for all posts using browser."""
+    """Fetch first- AND second-level comments for all posts using the browser.
+
+    Returns (l1_records, l2_records) — written to separate tables per the data
+    model agreement (一级评论 / 二级评论).
+    """
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
         headless=True,
@@ -469,7 +547,8 @@ async def fetch_comments_for_posts(posts):
     await context.add_cookies(cookies)
 
     page = await context.new_page()
-    all_records = []
+    l1_records = []
+    l2_records = []
 
     for vi, post in enumerate(posts):
         aweme_id = post['aweme_id']
@@ -492,6 +571,7 @@ async def fetch_comments_for_posts(posts):
 
         cursor = 0
         video_comments = 0
+        video_replies = 0
         max_comments = min(comment_count, 100)
 
         while video_comments < max_comments:
@@ -503,21 +583,7 @@ async def fetch_comments_for_posts(posts):
                 f'&device_platform=webapp&aid=6383'
                 f'&cookie_enabled=true&platform=PC'
             )
-            try:
-                data = await asyncio.wait_for(
-                    page.evaluate(
-                        """async (url) => {
-                            const resp = await fetch(url, {
-                                headers: {'Accept': 'application/json', 'Referer': 'https://www.douyin.com/'},
-                                credentials: 'include',
-                            });
-                            return await resp.json();
-                        }""", url
-                    ), timeout=30
-                )
-            except:
-                break
-
+            data = await _browser_get_json(page, url)
             if not data or data.get('status_code') != 0:
                 break
             comments = data.get('comments', [])
@@ -528,21 +594,27 @@ async def fetch_comments_for_posts(posts):
             for c in comments:
                 user = c.get('user', {})
                 ct = c.get('create_time', 0)
-                record = {
+                cid = c.get('cid', '')
+                reply_total = c.get('reply_comment_total', 0)
+                l1_records.append({
+                    '评论ID': cid,
                     '评论内容': c.get('text', ''),
                     '评论者昵称': user.get('nickname', ''),
                     '评论者ID': user.get('uid', ''),
-                    '评论层级': '一级评论',
-                    '所属视频ID': aweme_id,
-                    '所属视频描述': (post['desc'] or '')[:100],
+                    '所属作品ID': aweme_id,
+                    '所属作品描述': (post['desc'] or '')[:100],
                     '点赞数': c.get('digg_count', 0),
-                    '回复数': c.get('reply_comment_total', 0),
+                    '回复数': reply_total,
                     '评论时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ct)) if ct else '',
                     '搜索关键词': KEYWORD,
                     '爬取时间': now,
-                }
-                all_records.append(record)
+                })
                 video_comments += 1
+                # Fetch second-level replies for this comment (if any)
+                if reply_total and cid:
+                    replies = await _fetch_replies(page, aweme_id, cid, user.get('nickname', ''))
+                    l2_records.extend(replies)
+                    video_replies += len(replies)
                 if video_comments >= max_comments:
                     break
 
@@ -551,11 +623,11 @@ async def fetch_comments_for_posts(posts):
             cursor = data.get('cursor', 0)
             await polite_sleep()
 
-        print(f'    Got {video_comments} comments')
+        print(f'    Got {video_comments} L1 comments, {video_replies} L2 replies')
 
     await browser.close()
     await pw.stop()
-    return all_records
+    return l1_records, l2_records
 
 
 async def main():
@@ -570,7 +642,7 @@ async def main():
     print(f'Video posts: {len(video_posts)}, Image posts: {len(image_posts)}')
 
     print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
-    feishu = FeishuBitable()
+    feishu = FeishuBitable(app_token=APP_TOKEN)
 
     # Clear old records in both tables
     feishu.delete_all_records(VIDEO_TABLE_ID)
@@ -596,21 +668,32 @@ async def main():
         print(f'Written {written}/{len(image_records)} image records')
     feishu.close()
 
-    print(f'\n=== Step 3: Fetch comments for all {len(posts)} posts ===')
-    comment_records = await fetch_comments_for_posts(posts)
-    print(f'Total comment records: {len(comment_records)}')
+    if SKIP_COMMENTS:
+        print('\n=== Skipping comments (SKIP_COMMENTS set) ===')
+        print('\n=== Done ===')
+        print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
+        return
 
-    if comment_records:
-        print('\n=== Step 4: Write comments to Feishu ===')
-        feishu = FeishuBitable()
-        feishu.delete_all_records(COMMENT_TABLE_ID)
-        written = feishu.write_records(comment_records, COMMENT_TABLE_ID)
-        print(f'Written {written} comment records')
+    print(f'\n=== Step 3: Fetch L1 + L2 comments for all {len(posts)} posts ===')
+    l1_records, l2_records = await fetch_comments_for_posts(posts)
+    print(f'L1 comments: {len(l1_records)}, L2 replies: {len(l2_records)}')
+
+    if l1_records or l2_records:
+        print('\n=== Step 4: Write comments to Feishu (separate tables) ===')
+        feishu = FeishuBitable(app_token=APP_TOKEN)
+        if l1_records:
+            feishu.delete_all_records(COMMENT_L1_TABLE_ID)
+            w1 = feishu.write_records(l1_records, COMMENT_L1_TABLE_ID)
+            print(f'Written {w1} 一级评论 records')
+        if l2_records:
+            feishu.delete_all_records(COMMENT_L2_TABLE_ID)
+            w2 = feishu.write_records(l2_records, COMMENT_L2_TABLE_ID)
+            print(f'Written {w2} 二级评论 records')
         feishu.close()
 
     print('\n=== Done ===')
     print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
-    print(f'Comments: {len(comment_records)}')
+    print(f'L1 comments: {len(l1_records)}, L2 replies: {len(l2_records)}')
 
 
 if __name__ == '__main__':
