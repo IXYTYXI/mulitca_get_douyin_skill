@@ -76,6 +76,10 @@ HEADLESS = os.environ.get("DOUYIN_HEADLESS", "1").lower() not in ("0", "false", 
 # since the reply API is bd-ticket-guard'd. Requires a headed browser.
 USE_UI_COMMENTS = os.environ.get("USE_UI_COMMENTS", "").lower() in ("1", "true", "yes")
 
+# Harvest image posts from authors' post-lists over HTTP (stable, no browser /
+# no captcha) in addition to the flaky browser image search. On by default.
+IMAGE_VIA_AUTHORS = os.environ.get("IMAGE_VIA_AUTHORS", "1").lower() not in ("0", "false", "no")
+
 # Append to existing tables instead of clearing them first (for adding another
 # keyword's data into the same bitable). Records carry 搜索关键词 so they stay
 # distinguishable.
@@ -123,6 +127,83 @@ Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']}
 window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
 Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
 """
+
+
+async def search_images_via_authors(keyword, seen_ids, date_filter=None,
+                                    max_authors=60, post_pages=2):
+    """Harvest image/note posts from the post-lists of authors found in the
+    video search — a stable HTTP-only alternative to the browser image search.
+
+    The /general/search/single/ image channel only returns real image posts via
+    a browser-signed request (which crashes in some runtimes); plain HTTP returns
+    videos. But the author post-list API (/aweme/post/) DOES return a creator's
+    image posts over plain HTTP with no captcha. So: collect authors from the
+    keyword's video results, then pull each author's posts and keep the image ones.
+    """
+    date_filter = date_filter or DateFilter()
+    results = []
+    dropped = 0
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        # 1. Collect author sec_uids from the video search.
+        secs = []
+        for off in range(0, 200, 20):
+            if len(secs) >= max_authors:
+                break
+            params = {
+                'keyword': keyword, 'search_channel': 'aweme_video_web', 'sort_type': 0,
+                'count': 20, 'offset': off, 'search_source': 'normal_search',
+                'cookie_enabled': 'true', 'device_platform': 'webapp', 'aid': '6383', 'platform': 'PC',
+            }
+            data = await fetch_json(client, f'{DOUYIN_API_BASE}/search/item/', params,
+                                    item_keys=('data',), label=f'authors off{off}')
+            items = data.get('data') or []
+            if not items:
+                break
+            for it in items:
+                a = (it.get('aweme_info') or {}).get('author') or {}
+                su = a.get('sec_uid')
+                if su and su not in secs:
+                    secs.append(su)
+            if not data.get('has_more', 0):
+                break
+            await polite_sleep()
+        print(f'  [Author harvest] {len(secs)} authors from video search')
+
+        # 2. Pull each author's posts; keep image/note posts.
+        for i, su in enumerate(secs):
+            cursor = 0
+            for page in range(post_pages):
+                params = {
+                    'device_platform': 'webapp', 'aid': '6383', 'sec_user_id': su,
+                    'max_cursor': cursor, 'count': 20, 'cookie_enabled': 'true', 'platform': 'PC',
+                }
+                data = await fetch_json(client, f'{DOUYIN_API_BASE}/aweme/post/', params,
+                                        item_keys=('aweme_list',), label=f'post a{i}')
+                lst = data.get('aweme_list') or []
+                if not lst:
+                    break
+                for a in lst:
+                    aid = a.get('aweme_id', '')
+                    if not aid or aid in seen_ids:
+                        continue
+                    imgs = a.get('images') or []
+                    is_image = len(imgs) > 0 or a.get('aweme_type', 0) in (68, 150) or a.get('media_type', -1) == 2
+                    if not is_image:
+                        continue
+                    seen_ids.add(aid)
+                    if not date_filter.matches(a.get('create_time', 0)):
+                        dropped += 1
+                        continue
+                    results.append(parse_post(a))
+                if not data.get('has_more', 0):
+                    break
+                cursor = data.get('max_cursor', 0)
+                await polite_sleep()
+
+    if date_filter.has_custom_range:
+        print(f'  [Author harvest] dropped {dropped} image posts outside the date range')
+    print(f'  [Author harvest] {len(results)} image/note posts')
+    return results
 
 
 async def _browser_search_images(keyword, seen_ids, date_filter=None):
@@ -384,6 +465,12 @@ async def search_all_posts():
     print('[Phase 2] Searching image/note posts via browser API...')
     image_posts_from_browser = await _browser_search_images(KEYWORD, seen_ids, DATE_FILTER)
     all_posts.extend(image_posts_from_browser)
+
+    # --- Phase 2b: Image posts via author post-lists (HTTP, stable) ---
+    if IMAGE_VIA_AUTHORS:
+        print('[Phase 2b] Harvesting image/note posts from author post-lists (HTTP)...')
+        image_posts_from_authors = await search_images_via_authors(KEYWORD, seen_ids, DATE_FILTER)
+        all_posts.extend(image_posts_from_authors)
 
     image_count = sum(1 for p in all_posts if p['type'] == 'image')
     print(f'Total unique posts found: {len(all_posts)}')
