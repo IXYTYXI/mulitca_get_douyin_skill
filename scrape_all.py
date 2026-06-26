@@ -70,6 +70,11 @@ SKIP_L2 = os.environ.get("SKIP_L2", "").lower() in ("1", "true", "yes")
 # image-search (Phase 2) and reply (L2) data. Set DOUYIN_HEADLESS=0 or pass
 # --headed to use a visible browser. main.py may override this attribute.
 HEADLESS = os.environ.get("DOUYIN_HEADLESS", "1").lower() not in ("0", "false", "no")
+
+# Scrape comments by driving the page UI (simulated clicks on "展开N条回复")
+# instead of the raw reply API. This is how second-level replies are obtained,
+# since the reply API is bd-ticket-guard'd. Requires a headed browser.
+USE_UI_COMMENTS = os.environ.get("USE_UI_COMMENTS", "").lower() in ("1", "true", "yes")
 L2_REPLY_TIMEOUT = int(os.environ.get("L2_REPLY_TIMEOUT", "8"))   # seconds per reply fetch
 L2_DRY_GIVEUP = int(os.environ.get("L2_DRY_GIVEUP", "3"))         # consecutive empty fetches -> stop L2 for this post
 
@@ -585,6 +590,59 @@ async def _fetch_replies(page, aweme_id, comment_id, parent_text_user, max_repli
     return out
 
 
+async def fetch_comments_ui(posts):
+    """Fetch L1 + L2 comments by driving the page UI (simulated clicks).
+
+    Opens one headed, logged-in browser and walks each post's comment panel,
+    clicking every '展开N条回复' so Douyin's own JS loads the replies (bypassing
+    the bd-ticket-guard reply-API block). Returns (l1_records, l2_records).
+    """
+    from core.comment_ui import scrape_comments_ui
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(
+        headless=HEADLESS,   # should be False for clicks to work reliably
+        args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+    )
+    context = await browser.new_context(
+        viewport={'width': 1400, 'height': 950},
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        locale='zh-CN', timezone_id='Asia/Shanghai',
+    )
+    await context.add_init_script(STEALTH_JS)
+    cookies = []
+    for item in DOUYIN_COOKIE.split(';'):
+        item = item.strip()
+        if '=' in item:
+            n, v = item.split('=', 1)
+            cookies.append({'name': n.strip(), 'value': v.strip(), 'domain': '.douyin.com', 'path': '/'})
+    await context.add_cookies(cookies)
+    page = await context.new_page()
+
+    l1_all, l2_all = [], []
+    for vi, post in enumerate(posts):
+        if post.get('comment_count', 0) == 0:
+            print(f'  [{vi+1}/{len(posts)}] Skip {post["aweme_id"]} (0 comments)')
+            continue
+        print(f'  [{vi+1}/{len(posts)}] {post["aweme_id"]} (comments: {post["comment_count"]}) [UI]')
+        try:
+            l1, l2 = await scrape_comments_ui(
+                page, post['aweme_id'], keyword=KEYWORD, desc=post.get('desc', ''),
+                max_l1=MAX_COMMENTS_PER_POST,
+            )
+            l1_all.extend(l1)
+            l2_all.extend(l2)
+        except Exception as e:
+            print(f'    UI comment scrape failed: {e}')
+        await polite_sleep()
+
+    try:
+        await browser.close()
+        await pw.stop()
+    except Exception:
+        pass
+    return l1_all, l2_all
+
+
 async def fetch_comments_for_posts(posts):
     """Fetch first- AND second-level comments for all posts using the browser.
 
@@ -749,8 +807,12 @@ async def main():
         print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
         return
 
-    print(f'\n=== Step 3: Fetch L1 + L2 comments for all {len(posts)} posts ===')
-    l1_records, l2_records = await fetch_comments_for_posts(posts)
+    mode = 'UI clicks' if USE_UI_COMMENTS else 'API'
+    print(f'\n=== Step 3: Fetch L1 + L2 comments for all {len(posts)} posts ({mode}) ===')
+    if USE_UI_COMMENTS:
+        l1_records, l2_records = await fetch_comments_ui(posts)
+    else:
+        l1_records, l2_records = await fetch_comments_for_posts(posts)
     print(f'L1 comments: {len(l1_records)}, L2 replies: {len(l2_records)}')
 
     if l1_records or l2_records:

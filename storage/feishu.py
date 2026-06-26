@@ -283,6 +283,7 @@ class FeishuBitable:
             {"field_name": "评论者ID", "type": 1},
             {"field_name": "父评论ID", "type": 1},
             {"field_name": "回复对象", "type": 1},
+            {"field_name": "所属一级评论作者", "type": 1},
             {"field_name": "所属作品ID", "type": 1},
             {"field_name": "点赞数", "type": 2},
             {"field_name": "评论时间", "type": 1},
