@@ -156,6 +156,19 @@ python main.py trending                       # Trending videos
 python main.py video VIDEO_ID --comments     # Single video details + comments
 ```
 
+### Create a new Bitable and write into it (reusable)
+
+`scrape-to-bitable` creates a **new** Feishu Bitable (optionally inside a Drive folder), scrapes a keyword, and writes the results — so you get a reusable table in one shot:
+
+```bash
+# Create the table inside a Drive folder (pass the folder token or its URL)
+python main.py scrape-to-bitable "咖啡" --folder ZvZ0fN9YdlYt26dGCMDcDjo3nMc -n 50 --start-date 2025-01-01 --end-date 2025-06-01
+```
+
+It prints the new `app_token` / `table_id` / URL. To **reuse** that table later, set `FEISHU_APP_TOKEN=<app_token>` in `.env`.
+
+> **Folder permission:** creating a Bitable inside a folder requires the self-built app to be a **collaborator with edit rights** on that folder, and the app must have `drive:drive` + `bitable:app` permissions published. Otherwise Feishu returns `DriveNodePermNotAllow` — share the folder with the app, then retry. Omit `--folder` to create the file in the app's own space instead.
+
 ## Rate Limiting & Delay Strategy
 
 Douyin throttles requests that are too fast **or too regular**. When it triggers, the search endpoints usually still return HTTP 200 but with `status_code == 0` and an **empty `data` array** — which a naive scraper misreads as "no more results" and stops early. The scraper guards against this in `core/throttle.py`:

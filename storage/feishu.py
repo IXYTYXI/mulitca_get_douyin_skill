@@ -51,6 +51,44 @@ class FeishuBitable:
             "Content-Type": "application/json; charset=utf-8",
         }
 
+    def create_app(self, name: str, folder_token: str = "") -> dict:
+        """Create a NEW Bitable app (multidimensional table file).
+
+        ``folder_token`` places the new file inside a Drive folder (the app must
+        be a collaborator with edit rights on that folder, otherwise Feishu
+        returns ``DriveNodePermNotAllow``). Empty ``folder_token`` creates it in
+        the app's own space.
+
+        On success sets ``self.app_token`` to the new app and returns the app
+        info dict: ``{app_token, default_table_id, url, name, ...}``.
+        """
+        url = f"{FEISHU_API_BASE}/bitable/v1/apps"
+        body = {"name": name}
+        if folder_token:
+            body["folder_token"] = folder_token
+        resp = self._client.post(url, headers=self._headers(), json=body)
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(
+                f"Failed to create bitable app: code={data.get('code')} "
+                f"msg={data.get('msg')}"
+            )
+        app = data["data"]["app"]
+        self.app_token = app["app_token"]
+        print(f"[Feishu] Created bitable '{name}': {app.get('url', self.app_token)}")
+        return app
+
+    def delete_app(self, app_token: str = "") -> bool:
+        """Delete a Bitable app via the Drive files API."""
+        at = app_token or self.app_token
+        url = f"{FEISHU_API_BASE}/drive/v1/files/{at}"
+        resp = self._client.delete(
+            url,
+            headers={"Authorization": f"Bearer {self._get_tenant_token()}"},
+            params={"type": "bitable"},
+        )
+        return resp.json().get("code") == 0
+
     def list_tables(self) -> list:
         """List all tables in the Bitable app."""
         url = f"{FEISHU_API_BASE}/bitable/v1/apps/{self.app_token}/tables"

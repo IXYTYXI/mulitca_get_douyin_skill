@@ -191,6 +191,82 @@ async def _trending(feishu_table, save_local, headless):
             _output(records, feishu_table, save_local, "trending", "trending")
 
 
+def _folder_token(value: str) -> str:
+    """Accept a raw folder token or a full Feishu folder URL, return the token."""
+    if not value:
+        return ""
+    value = value.strip().rstrip("/")
+    if "/folder/" in value:
+        value = value.split("/folder/")[-1]
+    # strip any query string
+    return value.split("?")[0]
+
+
+@cli.command(name="scrape-to-bitable")
+@click.argument("keyword")
+@click.option("--folder", help="飞书文件夹 token 或 URL（新建多维表格的位置；留空建在应用空间）")
+@click.option("--name", default="抖音作品数据", help="新建多维表格的名称")
+@click.option("--max-count", "-n", default=50, help="最大爬取数量")
+@click.option("--sort", "-s", type=click.Choice(["综合", "最新", "最热"]), default="综合")
+@click.option("--publish-time", type=click.Choice(["0", "1", "7", "182"]), default="0",
+              help="发布时间预设范围: 0=不限 1=一天内 7=一周内 182=半年内")
+@click.option("--start-date", help="自定义起始日期 (含当天) YYYY-MM-DD")
+@click.option("--end-date", help="自定义结束日期 (含当天) YYYY-MM-DD")
+def scrape_to_bitable(keyword, folder, name, max_count, sort, publish_time, start_date, end_date):
+    """新建一个飞书多维表格，爬取关键词数据并写入（之后可复用该表）。"""
+    sort_map = {"综合": 0, "最新": 1, "最热": 2}
+    try:
+        DateFilter.from_inputs(publish_time, start_date, end_date)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    asyncio.run(_scrape_to_bitable(
+        keyword, _folder_token(folder), name, max_count, sort_map[sort],
+        publish_time, start_date, end_date,
+    ))
+
+
+async def _scrape_to_bitable(keyword, folder_token, name, max_count, sort_type,
+                             publish_time, start_date, end_date):
+    # 1. Create the bitable + a video table with the right fields
+    feishu = FeishuBitable()
+    try:
+        app = feishu.create_app(name, folder_token)
+    except RuntimeError as e:
+        msg = str(e)
+        click.echo(f"新建多维表格失败: {msg}")
+        if "DriveNodePermNotAllow" in msg or "1254701" in msg:
+            click.echo("原因: 自建应用对该文件夹没有写入权限。")
+            click.echo("请在飞书里打开该文件夹 → 右上角「...」/共享 → 添加你的自建应用为协作者并授予「可编辑」，")
+            click.echo("并确认应用已开通 drive:drive (云空间) 与 bitable:app 权限且已发布版本。")
+        feishu.close()
+        return
+    app_token = app["app_token"]
+    app_url = app.get("url", f"https://feishu.cn/base/{app_token}")
+    table_id = feishu.create_table("抖音作品数据")
+    feishu.setup_video_table(table_id)
+
+    # 2. Scrape
+    results = []
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        scraper = KeywordScraper(client)
+        results = await scraper.search_videos(
+            keyword, max_count, sort_type,
+            publish_time=publish_time, start_date=start_date, end_date=end_date,
+        )
+
+    # 3. Write
+    records = [video_to_feishu_record(v) for v in results]
+    written = feishu.write_records(records, table_id) if records else 0
+    feishu.close()
+
+    click.echo("\n=== 完成 ===")
+    click.echo(f"多维表格: {app_url}")
+    click.echo(f"app_token: {app_token}")
+    click.echo(f"table_id : {table_id}")
+    click.echo(f"写入记录 : {written}/{len(records)}")
+    click.echo(f"复用方法 : 在 .env 设置 FEISHU_APP_TOKEN={app_token}，后续命令即可写入这张表。")
+
+
 @cli.command()
 @click.option("--type", "table_type", type=click.Choice(["video", "user", "comment", "trending"]), required=True)
 @click.option("--table-id", required=True, help="飞书表格 table_id")
