@@ -58,7 +58,13 @@ MAX_POSTS = int(os.environ.get("MAX_POSTS_TOTAL", "0"))
 # replies for every first-level comment explodes on viral posts, so cap them.
 MAX_COMMENTS_PER_POST = int(os.environ.get("MAX_COMMENTS_PER_POST", "100"))  # L1 per post
 MAX_REPLIES_PER_L1 = int(os.environ.get("MAX_REPLIES_PER_L1", "20"))         # L2 per L1 comment
-MAX_REPLIES_PER_POST = int(os.environ.get("MAX_REPLIES_PER_POST", "60"))     # L2 total per post (0 = no cap)
+MAX_REPLIES_PER_POST = int(os.environ.get("MAX_REPLIES_PER_POST", "60"))     # L2 total per post
+# L2 (reply) scraping is guarded by Douyin's bd-ticket-guard and is often
+# blocked/empty. Skip it entirely, fail fast, and give up on a post after a few
+# consecutive empty reply fetches so it can never stall the L1 crawl.
+SKIP_L2 = os.environ.get("SKIP_L2", "").lower() in ("1", "true", "yes")
+L2_REPLY_TIMEOUT = int(os.environ.get("L2_REPLY_TIMEOUT", "8"))   # seconds per reply fetch
+L2_DRY_GIVEUP = int(os.environ.get("L2_DRY_GIVEUP", "3"))         # consecutive empty fetches -> stop L2 for this post
 
 
 def _passes_engagement(post):
@@ -537,7 +543,7 @@ async def _fetch_replies(page, aweme_id, comment_id, parent_text_user, max_repli
             f'&cursor={cursor}&count=20&item_type=0'
             f'&device_platform=webapp&aid=6383&cookie_enabled=true&platform=PC'
         )
-        data = await _browser_get_json(page, url)
+        data = await _browser_get_json(page, url, timeout=L2_REPLY_TIMEOUT)
         if not data or data.get('status_code') != 0:
             break
         replies = data.get('comments') or []
@@ -625,6 +631,7 @@ async def fetch_comments_for_posts(posts):
         cursor = 0
         video_comments = 0
         video_replies = 0
+        l2_dry = 0   # consecutive empty reply fetches for this post
         max_comments = min(comment_count, MAX_COMMENTS_PER_POST)
 
         while video_comments < max_comments:
@@ -663,13 +670,19 @@ async def fetch_comments_for_posts(posts):
                     '爬取时间': now,
                 })
                 video_comments += 1
-                # Fetch second-level replies (bounded per L1 and per post)
-                post_budget_left = (MAX_REPLIES_PER_POST - video_replies) if MAX_REPLIES_PER_POST else MAX_REPLIES_PER_L1
-                if reply_total and cid and post_budget_left > 0:
+                # Fetch second-level replies — bounded, fail-fast, and abandoned
+                # for the post after a few empty fetches (reply API is often blocked).
+                post_budget_left = MAX_REPLIES_PER_POST - video_replies
+                if (not SKIP_L2 and reply_total and cid
+                        and post_budget_left > 0 and l2_dry < L2_DRY_GIVEUP):
                     cap = min(MAX_REPLIES_PER_L1, post_budget_left)
                     replies = await _fetch_replies(page, aweme_id, cid, user.get('nickname', ''), max_replies=cap)
-                    l2_records.extend(replies)
-                    video_replies += len(replies)
+                    if replies:
+                        l2_records.extend(replies)
+                        video_replies += len(replies)
+                        l2_dry = 0
+                    else:
+                        l2_dry += 1
                 if video_comments >= max_comments:
                     break
 
