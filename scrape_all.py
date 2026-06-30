@@ -45,10 +45,14 @@ SKIP_COMMENTS = os.environ.get("SKIP_COMMENTS", "").lower() in ("1", "true", "ye
 # main.py sets this when creating/targeting a specific bitable.
 APP_TOKEN = os.environ.get("FEISHU_APP_TOKEN", "")
 
-# Engagement filter: keep a post only if its like / collect / comment counts
-# clear MIN_ENGAGEMENT (strictly greater). ENGAGEMENT_LOGIC 'or' = any metric
-# passes; 'and' = all must pass. MIN_ENGAGEMENT <= 0 disables the filter.
+# Engagement filter: keep a post based on its like / collect / comment counts.
+# MIN_ENGAGEMENT keeps posts whose metrics are strictly greater than the value;
+# MAX_ENGAGEMENT keeps posts whose metrics are strictly less than the value.
+# ENGAGEMENT_LOGIC 'or' = any metric passes; 'and' = all must pass — applied
+# within each bound. When both bounds are set a post must satisfy both.
+# A bound <= 0 disables that bound; both disabled = no filter.
 MIN_ENGAGEMENT = int(os.environ.get("MIN_ENGAGEMENT", "0"))
+MAX_ENGAGEMENT = int(os.environ.get("MAX_ENGAGEMENT", "0"))
 ENGAGEMENT_LOGIC = os.environ.get("ENGAGEMENT_LOGIC", "or").lower()
 # Cap on total posts kept (0 = no cap). Video/image are interleaved so both
 # types are represented up to the cap.
@@ -89,22 +93,33 @@ L2_DRY_GIVEUP = int(os.environ.get("L2_DRY_GIVEUP", "3"))         # consecutive 
 
 
 def _passes_engagement(post):
-    if MIN_ENGAGEMENT <= 0:
+    if MIN_ENGAGEMENT <= 0 and MAX_ENGAGEMENT <= 0:
         return True
-    checks = [
-        post.get('digg_count', 0) > MIN_ENGAGEMENT,
-        post.get('collect_count', 0) > MIN_ENGAGEMENT,
-        post.get('comment_count', 0) > MIN_ENGAGEMENT,
-    ]
-    return all(checks) if ENGAGEMENT_LOGIC == 'and' else any(checks)
+    metrics = (
+        post.get('digg_count', 0),
+        post.get('collect_count', 0),
+        post.get('comment_count', 0),
+    )
+    combine = all if ENGAGEMENT_LOGIC == 'and' else any
+    ok = True
+    if MIN_ENGAGEMENT > 0:
+        ok = ok and combine(m > MIN_ENGAGEMENT for m in metrics)
+    if MAX_ENGAGEMENT > 0:
+        ok = ok and combine(m < MAX_ENGAGEMENT for m in metrics)
+    return ok
 
 
 def _apply_engagement_and_cap(posts):
     """Filter by engagement, then interleave video/image up to MAX_POSTS."""
     kept = [p for p in posts if _passes_engagement(p)]
-    if MIN_ENGAGEMENT > 0:
+    if MIN_ENGAGEMENT > 0 or MAX_ENGAGEMENT > 0:
+        bounds = []
+        if MIN_ENGAGEMENT > 0:
+            bounds.append(f'> {MIN_ENGAGEMENT}')
+        if MAX_ENGAGEMENT > 0:
+            bounds.append(f'< {MAX_ENGAGEMENT}')
         print(f'[Engagement] kept {len(kept)}/{len(posts)} posts '
-              f'({ENGAGEMENT_LOGIC.upper()} like/collect/comment > {MIN_ENGAGEMENT})')
+              f'({ENGAGEMENT_LOGIC.upper()} like/collect/comment {" & ".join(bounds)})')
     if not MAX_POSTS or len(kept) <= MAX_POSTS:
         return kept
     videos = [p for p in kept if p['type'] == 'video']

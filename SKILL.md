@@ -204,6 +204,26 @@ It prints the new `app_token` / `table_id` / URL. To **reuse** that table later,
 
 > **Folder permission:** creating a Bitable inside a folder requires the self-built app to be a **collaborator with edit rights** on that folder, and the app must have `drive:drive` + `bitable:app` permissions published. Otherwise Feishu returns `DriveNodePermNotAllow` — share the folder with the app, then retry. Omit `--folder` to create the file in the app's own space instead.
 
+### Engagement filter (likes / collects / comments)
+
+Filter posts by interaction counts with a lower bound, an upper bound, or both. The three metrics checked are 点赞/收藏/评论 (`digg_count` / `collect_count` / `comment_count`).
+
+| Option | Meaning |
+|--------|---------|
+| `--min-engagement N` | keep posts whose metrics are **> N** (lower bound; `0`=off) |
+| `--max-engagement N` | keep posts whose metrics are **< N** (upper bound; `0`=off) |
+| `--engagement-logic or\|and` | `or`=any metric passes, `and`=all must pass — applied within each bound separately |
+
+```bash
+# Keep only posts where ANY of like/collect/comment is < 50 (low-engagement)
+python main.py scrape-to-bitable "小学数学" --folder <folder> --max-engagement 50 --engagement-logic or
+
+# Band filter: any metric > 30 AND any metric < 50
+python main.py scrape-to-bitable "关键词" --folder <folder> --min-engagement 30 --max-engagement 50
+```
+
+For `scrape_all.py` (append/reuse flow) set the env vars `MIN_ENGAGEMENT` / `MAX_ENGAGEMENT` / `ENGAGEMENT_LOGIC` instead.
+
 ## Rate Limiting & Delay Strategy
 
 Douyin throttles requests that are too fast **or too regular**. When it triggers, the search endpoints usually still return HTTP 200 but with `status_code == 0` and an **empty `data` array** — which a naive scraper misreads as "no more results" and stops early. The scraper guards against this in `core/throttle.py`:
