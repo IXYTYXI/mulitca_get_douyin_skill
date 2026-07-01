@@ -43,6 +43,49 @@ python main.py scrape-to-bitable "关键词" --folder <folder> --no-comments
 
 Reuse an existing bitable by setting `FEISHU_APP_TOKEN` + `VIDEO_TABLE_ID` / `IMAGE_TABLE_ID` / `COMMENT_L1_TABLE_ID` / `COMMENT_L2_TABLE_ID` in `.env`, then run `python scrape_all.py`.
 
+## Author Homepage Mode (作者主页)
+
+Besides keyword search, the skill can scrape **one author's homepage**: the
+author profile (**粉丝量 / follower count**) plus a selected slice of their posts
+(media files, 点赞/评论/收藏 engagement, and comments). This writes to a **5-table**
+bitable — the canonical 4 tables **plus** a `作者信息` table for the profile.
+
+### Which posts get scraped (avoiding pinned videos)
+
+Pinned videos sit at the top of a homepage and carry the API's `is_top` flag.
+The selector **drops detected pinned posts and keeps the next 5**. If the API
+does not return `is_top`, it falls back to **skipping the first 3** as pinned —
+i.e. the **4th–8th** posts (`--skip-top 3` + `--recent-count 5`). Both are
+tunable.
+
+```bash
+# One shot: create the 5-table bitable AND scrape the author (profile + posts + comments)
+python main.py scrape-author "https://www.douyin.com/user/MS4wLjABAAAA..." --folder <folder>
+
+# Keep the most recent 8 non-pinned posts; skip 3 pinned on the fallback path
+python main.py scrape-author "<homepage_url>" --folder <folder> --recent-count 8 --skip-top 3
+
+# Only structure (5 empty tables), or skip comments, or use a headed browser:
+python main.py scrape-author "<homepage_url>" --folder <folder> --structure-only
+python main.py scrape-author "<homepage_url>" --folder <folder> --no-comments
+python main.py scrape-author "<homepage_url>" --folder <folder> --ui-comments   # incl. 二级评论
+```
+
+The `作者信息` table columns: 用户ID / 昵称 / 简介 / **粉丝数** / 关注数 / 获赞数 /
+作品数 / 主页链接(raw URL) / 爬取时间. Posts and comments follow the same
+`视频作品 / 图文作品 / 一级评论 / 二级评论` schema and rules as keyword mode
+(real media attachments, raw-URL link fields).
+
+**Reuse an existing bitable:** set `FEISHU_APP_TOKEN` + `AUTHOR_TABLE_ID` +
+`VIDEO_TABLE_ID` / `IMAGE_TABLE_ID` / `COMMENT_L1_TABLE_ID` / `COMMENT_L2_TABLE_ID`
+and `DOUYIN_AUTHOR_URL` (optionally `AUTHOR_TOP_SKIP` / `AUTHOR_RECENT_COUNT`) in
+`.env`, then run `python scrape_all.py` — setting `DOUYIN_AUTHOR_URL` switches
+`scrape_all.py` from keyword search to author mode automatically.
+
+> Fan count is read from `/user/profile/other/` over HTTP first; if that endpoint
+> is signature-blocked, it retries from a browser context, then falls back to the
+> `follower_count` embedded in a post's author object.
+
 ## First-Run Setup
 
 The scraper code ships as supporting files with this skill. On first use, the agent must set up the environment:
@@ -187,6 +230,7 @@ python main.py search "keyword" -n 50       # Keyword search (video only)
 python main.py search "keyword" --publish-time 7              # ...within the last week
 python main.py search "keyword" --start-date 2025-01-01 --end-date 2025-06-01  # ...custom date range
 python main.py user "https://..." -n 100     # Author profile (all post types)
+python main.py scrape-author "https://www.douyin.com/user/..." --folder <folder>  # Author homepage: 粉丝量 + posts + comments → 5-table bitable
 python main.py trending                       # Trending videos
 python main.py video VIDEO_ID --comments     # Single video details + comments
 ```

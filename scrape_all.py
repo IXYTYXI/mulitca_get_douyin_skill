@@ -9,6 +9,7 @@ def print(*args, **kwargs):
 
 import asyncio
 import os
+import re
 import time
 import zlib
 from datetime import datetime
@@ -17,8 +18,10 @@ from playwright.async_api import async_playwright
 from core.client import DouyinClient
 from core.datefilter import DateFilter
 from core.throttle import fetch_json, polite_sleep, jittered_delay, backoff_delay
-from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY, EMPTY_RETRY
-from storage.feishu import FeishuBitable, url_field
+from config.settings import DOUYIN_COOKIE, DOUYIN_API_BASE, REQUEST_DELAY, EMPTY_RETRY, MAX_PAGES
+from scrapers.user import UserScraper
+from models.data import UserInfo
+from storage.feishu import FeishuBitable, url_field, author_to_feishu_record
 from storage.downloader import download_file, download_video_media, cleanup_downloads, DOWNLOAD_DIR
 
 VIDEO_TABLE_ID = os.environ.get("VIDEO_TABLE_ID", "YOUR_VIDEO_TABLE_ID")
@@ -27,6 +30,21 @@ IMAGE_TABLE_ID = os.environ.get("IMAGE_TABLE_ID", "YOUR_IMAGE_TABLE_ID")
 COMMENT_L1_TABLE_ID = os.environ.get("COMMENT_L1_TABLE_ID") or os.environ.get("COMMENT_TABLE_ID", "YOUR_COMMENT_L1_TABLE_ID")
 COMMENT_L2_TABLE_ID = os.environ.get("COMMENT_L2_TABLE_ID", "YOUR_COMMENT_L2_TABLE_ID")
 KEYWORD = os.environ.get("DOUYIN_KEYWORD", "YOUR_KEYWORD")
+
+# --- Author-homepage mode --------------------------------------------------
+# When DOUYIN_AUTHOR_URL is set, the pipeline scrapes ONE author's homepage
+# instead of running a keyword search: it records the author profile (粉丝量 /
+# follower count) into AUTHOR_TABLE_ID and scrapes a selected slice of the
+# author's posts (media files, engagement counts, and comments) into the same
+# 视频作品 / 图文作品 / 一级评论 / 二级评论 tables.
+AUTHOR_URL = os.environ.get("DOUYIN_AUTHOR_URL", "")
+AUTHOR_TABLE_ID = os.environ.get("AUTHOR_TABLE_ID") or os.environ.get("USER_TABLE_ID", "")
+# Pinned videos sit at the top of a homepage (marked is_top). We drop the
+# detected pinned posts and keep the next AUTHOR_RECENT_COUNT. If the API does
+# not expose is_top, fall back to skipping the first AUTHOR_TOP_SKIP as pinned —
+# i.e. "第4-8条视频" when skip=3 and count=5.
+AUTHOR_TOP_SKIP = int(os.environ.get("AUTHOR_TOP_SKIP", "3"))
+AUTHOR_RECENT_COUNT = int(os.environ.get("AUTHOR_RECENT_COUNT", "5"))
 
 # Date / time-range filter, configured via environment variables:
 #   DOUYIN_PUBLISH_TIME  predefined server-side range (0/1/7/182), default 0
@@ -553,6 +571,7 @@ def parse_post(aweme):
     return {
         'aweme_id': aweme_id,
         'type': post_type,
+        'is_top': aweme.get('is_top', 0),
         'desc': aweme.get('desc', ''),
         'author_nickname': author.get('nickname', ''),
         'author_sec_uid': sec_uid,
@@ -870,21 +889,12 @@ async def fetch_comments_for_posts(posts):
     return l1_records, l2_records
 
 
-async def main():
-    print('=== Step 1: Search ALL posts (video + image) ===')
-    posts = await search_all_posts()
-    if not posts:
-        print('No posts found!')
-        return
+def write_posts_to_feishu(posts, feishu):
+    """Download each post's media, upload to Feishu, and write the post records
+    into the 视频作品 / 图文作品 tables. Returns (video_records, image_records).
 
-    video_posts = [p for p in posts if p['type'] == 'video']
-    image_posts = [p for p in posts if p['type'] == 'image']
-    print(f'Video posts: {len(video_posts)}, Image posts: {len(image_posts)}')
-
-    print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
-    feishu = FeishuBitable(app_token=APP_TOKEN)
-
-    # Clear old records in both tables (unless appending another keyword)
+    Shared by the keyword pipeline and the author-homepage pipeline.
+    """
     if not APPEND:
         feishu.delete_all_records(VIDEO_TABLE_ID)
         feishu.delete_all_records(IMAGE_TABLE_ID)
@@ -909,14 +919,12 @@ async def main():
     if image_records:
         written = feishu.write_records(image_records, IMAGE_TABLE_ID)
         print(f'Written {written}/{len(image_records)} image records')
-    feishu.close()
+    return video_records, image_records
 
-    if SKIP_COMMENTS:
-        print('\n=== Skipping comments (SKIP_COMMENTS set) ===')
-        print('\n=== Done ===')
-        print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
-        return
 
+async def scrape_and_write_comments(posts):
+    """Fetch L1 + L2 comments for the given posts and write them to the
+    一级评论 / 二级评论 tables. Shared by both pipelines. Returns (l1, l2)."""
     mode = 'UI clicks' if USE_UI_COMMENTS else 'API'
     print(f'\n=== Step 3: Fetch L1 + L2 comments for all {len(posts)} posts ({mode}) ===')
     if USE_UI_COMMENTS:
@@ -939,6 +947,240 @@ async def main():
             w2 = feishu.write_records(l2_records, COMMENT_L2_TABLE_ID)
             print(f'Written {w2} 二级评论 records')
         feishu.close()
+    return l1_records, l2_records
+
+
+def _extract_sec_uid(url: str) -> str:
+    """Pull the sec_uid out of a douyin author-homepage URL."""
+    m = re.search(r'/user/([A-Za-z0-9_-]+)', url or '')
+    return m.group(1) if m else ''
+
+
+async def _fetch_author_awemes(client, sec_uid, need):
+    """Page an author's post-list (/aweme/post/) over HTTP, preserving order and
+    the is_top pinned flag, until we have at least `need` posts or run out."""
+    out = []
+    cursor = 0
+    for page in range(MAX_PAGES):
+        if len(out) >= need:
+            break
+        params = {
+            'device_platform': 'webapp', 'aid': '6383', 'sec_user_id': sec_uid,
+            'max_cursor': cursor, 'count': 20, 'cookie_enabled': 'true', 'platform': 'PC',
+        }
+        data = await fetch_json(client, f'{DOUYIN_API_BASE}/aweme/post/', params,
+                                item_keys=('aweme_list',), label=f'author posts p{page}')
+        lst = data.get('aweme_list') or []
+        if not lst:
+            break
+        out.extend(lst)
+        if not data.get('has_more', 0):
+            break
+        cursor = data.get('max_cursor', 0)
+        await polite_sleep()
+    return out
+
+
+def _select_author_posts(awemes):
+    """From an author's post-list pick the target slice, skipping pinned videos.
+
+    Pinned posts carry is_top and sit at the top; we drop them and keep the next
+    AUTHOR_RECENT_COUNT. If no is_top flag is present, fall back to skipping the
+    first AUTHOR_TOP_SKIP as pinned. Returns (selected_awemes, note).
+    """
+    pinned = [a for a in awemes if a.get('is_top')]
+    if pinned:
+        base = [a for a in awemes if not a.get('is_top')]
+        note = f'detected {len(pinned)} pinned (is_top) post(s), dropped them'
+    else:
+        base = awemes[AUTHOR_TOP_SKIP:]
+        note = f'no is_top flag returned; skipped first {AUTHOR_TOP_SKIP} as pinned'
+    return base[:AUTHOR_RECENT_COUNT], note
+
+
+async def _browser_user_info(homepage_url):
+    """Fallback: fetch the author profile (incl. follower_count) from a browser
+    context when the plain-HTTP profile endpoint is signature-blocked."""
+    sec_uid = _extract_sec_uid(homepage_url)
+    if not sec_uid:
+        return None
+    url = (
+        f'{DOUYIN_API_BASE}/user/profile/other/'
+        f'?sec_user_id={sec_uid}&device_platform=webapp&aid=6383'
+        f'&cookie_enabled=true&platform=PC'
+    )
+    pw = br = None
+    try:
+        pw = await async_playwright().start()
+        br = await pw.chromium.launch(
+            headless=HEADLESS,
+            args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+        )
+        ctx = await br.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            locale='zh-CN', timezone_id='Asia/Shanghai',
+        )
+        await ctx.add_init_script(STEALTH_JS)
+        ck = []
+        for c in DOUYIN_COOKIE.split(';'):
+            c = c.strip()
+            if '=' in c:
+                n, v = c.split('=', 1)
+                ck.append({'name': n.strip(), 'value': v.strip(), 'domain': '.douyin.com', 'path': '/'})
+        await ctx.add_cookies(ck)
+        page = await ctx.new_page()
+        try:
+            await page.goto(homepage_url, wait_until='domcontentloaded', timeout=30000)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+        data = await _browser_get_json(page, url)
+        user = (data or {}).get('user') or {}
+        if not user:
+            return None
+        avatar = user.get('avatar_larger', {})
+        return UserInfo(
+            uid=user.get('uid', ''),
+            sec_uid=user.get('sec_uid', sec_uid),
+            nickname=user.get('nickname', ''),
+            signature=user.get('signature', ''),
+            follower_count=user.get('follower_count', 0),
+            following_count=user.get('following_count', 0),
+            total_favorited=user.get('total_favorited', 0),
+            aweme_count=user.get('aweme_count', 0),
+            avatar_url=avatar.get('url_list', [''])[0] if isinstance(avatar, dict) else '',
+            homepage_url=f'https://www.douyin.com/user/{sec_uid}',
+        )
+    except Exception as e:
+        print(f'  [Author] browser profile fetch failed: {e}')
+        return None
+    finally:
+        try:
+            if br:
+                await br.close()
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
+
+
+async def scrape_author():
+    """Scrape one author homepage: profile (fan count) + a selected slice of
+    posts (parsed into the standard post dict shape). Returns (user_info, posts).
+    """
+    sec_uid = _extract_sec_uid(AUTHOR_URL)
+    if not sec_uid:
+        print(f'[Author] cannot parse sec_uid from {AUTHOR_URL}')
+        return None, []
+
+    async with DouyinClient(cookies=DOUYIN_COOKIE) as client:
+        user_info = await UserScraper(client).get_user_info(AUTHOR_URL)
+        need = AUTHOR_TOP_SKIP + AUTHOR_RECENT_COUNT + 15
+        raw = await _fetch_author_awemes(client, sec_uid, need)
+
+    # Fan count is the headline requirement — fall back to a browser fetch, then
+    # to the follower_count embedded in a post's author object.
+    if not user_info or not user_info.follower_count:
+        fb = await _browser_user_info(AUTHOR_URL)
+        if fb and fb.follower_count:
+            if user_info:
+                user_info.follower_count = fb.follower_count
+                user_info.nickname = user_info.nickname or fb.nickname
+                user_info.aweme_count = user_info.aweme_count or fb.aweme_count
+                user_info.total_favorited = user_info.total_favorited or fb.total_favorited
+                user_info.following_count = user_info.following_count or fb.following_count
+                user_info.signature = user_info.signature or fb.signature
+            else:
+                user_info = fb
+    if user_info and not user_info.follower_count and raw:
+        fc = (raw[0].get('author') or {}).get('follower_count', 0)
+        if fc:
+            user_info.follower_count = fc
+
+    print(f'[Author] fetched {len(raw)} posts from homepage')
+    selected, note = _select_author_posts(raw)
+    print(f'[Author] {note}; selected {len(selected)} post(s)')
+    posts = [parse_post(a) for a in selected]
+    return user_info, posts
+
+
+async def main_author():
+    """Author-homepage pipeline: record the author profile (粉丝量) and scrape
+    the selected posts' media, engagement, and comments into the same tables."""
+    print('=== Author mode: scrape author homepage ===')
+    print(f'  Homepage: {AUTHOR_URL}')
+    user_info, posts = await scrape_author()
+
+    if user_info:
+        print(f'作者: {user_info.nickname} | 粉丝量: {user_info.follower_count} | '
+              f'获赞: {user_info.total_favorited} | 作品: {user_info.aweme_count}')
+    else:
+        print('[Author] WARNING: could not fetch author profile (fan count).')
+
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    feishu = FeishuBitable(app_token=APP_TOKEN)
+
+    # 1. Author profile (fan count) -> 作者信息 table.
+    if user_info and AUTHOR_TABLE_ID and 'YOUR_' not in AUTHOR_TABLE_ID:
+        if not APPEND:
+            feishu.delete_all_records(AUTHOR_TABLE_ID)
+        feishu.write_records([author_to_feishu_record(user_info, now)], AUTHOR_TABLE_ID)
+        print('Written author profile (粉丝量) to 作者信息 table')
+    elif user_info:
+        print('[Author] No AUTHOR_TABLE_ID configured; skipped writing author profile table.')
+
+    # 2. Selected posts' media + engagement -> 视频作品 / 图文作品.
+    video_records, image_records = [], []
+    if posts:
+        print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
+        video_records, image_records = write_posts_to_feishu(posts, feishu)
+    else:
+        print('[Author] No posts selected — nothing to download.')
+    feishu.close()
+
+    # 3. Comments for the selected posts.
+    l1_records, l2_records = [], []
+    if posts and not SKIP_COMMENTS:
+        l1_records, l2_records = await scrape_and_write_comments(posts)
+    elif SKIP_COMMENTS:
+        print('\n=== Skipping comments (SKIP_COMMENTS set) ===')
+
+    print('\n=== Done (author mode) ===')
+    if user_info:
+        print(f'作者: {user_info.nickname} | 粉丝量: {user_info.follower_count}')
+    print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
+    print(f'L1 comments: {len(l1_records)}, L2 replies: {len(l2_records)}')
+
+
+async def main():
+    # Author-homepage mode short-circuits the keyword search entirely.
+    if AUTHOR_URL:
+        await main_author()
+        return
+
+    print('=== Step 1: Search ALL posts (video + image) ===')
+    posts = await search_all_posts()
+    if not posts:
+        print('No posts found!')
+        return
+
+    video_posts = [p for p in posts if p['type'] == 'video']
+    image_posts = [p for p in posts if p['type'] == 'image']
+    print(f'Video posts: {len(video_posts)}, Image posts: {len(image_posts)}')
+
+    print(f'\n=== Step 2: Download media and upload to Feishu ({len(posts)} posts) ===')
+    feishu = FeishuBitable(app_token=APP_TOKEN)
+    video_records, image_records = write_posts_to_feishu(posts, feishu)
+    feishu.close()
+
+    if SKIP_COMMENTS:
+        print('\n=== Skipping comments (SKIP_COMMENTS set) ===')
+        print('\n=== Done ===')
+        print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')
+        return
+
+    l1_records, l2_records = await scrape_and_write_comments(posts)
 
     print('\n=== Done ===')
     print(f'Video records: {len(video_records)}, Image records: {len(image_records)}')

@@ -5,6 +5,7 @@ A Multica skill for scraping Douyin data (keyword search, author profiles, video
 ## Features
 
 - Keyword search: video + image/note posts (two-phase strategy)
+- Author homepage mode: follower count (粉丝量) + selected posts (skips pinned) + comments → 5-table bitable
 - Author profile scraping
 - Video detail & comment extraction
 - Feishu bitable integration with media attachments
@@ -26,6 +27,9 @@ python scrape_all.py
 
 # Or use CLI for specific tasks
 python main.py search "keyword" -n 50
+
+# Author homepage: profile (粉丝量) + posts + comments into a new 5-table bitable
+python main.py scrape-author "https://www.douyin.com/user/MS4wLjABAAAA..." --folder <folder>
 ```
 
 ## Import as Multica Skill

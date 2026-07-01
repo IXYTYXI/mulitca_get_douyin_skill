@@ -129,6 +129,49 @@ class FeishuBitable:
             "comment_l2_table_id": l2_tid,
         }
 
+    def create_author_bitable(self, name: str, folder_token: str = "") -> dict:
+        """Create the author-mode bitable: the canonical 4 post/comment tables
+        PLUS a 作者信息 table that holds the author profile (粉丝量 etc.).
+
+        Tables: 作者信息 / 视频作品 / 图文作品 / 一级评论 / 二级评论. Returns:
+        {app_token, url, author_table_id, video_table_id, image_table_id,
+         comment_l1_table_id, comment_l2_table_id}
+        """
+        app = self.create_app(name, folder_token)
+        app_token = app["app_token"]
+        default_table_id = app.get("default_table_id", "")
+
+        author_tid = self.create_table("作者信息")
+        self.setup_author_table(author_tid)
+        video_tid = self.create_table("视频作品")
+        self.setup_video_table(video_tid)
+        image_tid = self.create_table("图文作品")
+        self.setup_image_table(image_tid)
+        l1_tid = self.create_table("一级评论")
+        self.setup_comment_l1_table(l1_tid)
+        l2_tid = self.create_table("二级评论")
+        self.setup_comment_l2_table(l2_tid)
+
+        # Remove the empty default table Feishu auto-creates.
+        if default_table_id:
+            try:
+                self._client.delete(
+                    f"{FEISHU_API_BASE}/bitable/v1/apps/{app_token}/tables/{default_table_id}",
+                    headers=self._headers(),
+                )
+            except Exception:
+                pass
+
+        return {
+            "app_token": app_token,
+            "url": app.get("url", f"https://feishu.cn/base/{app_token}"),
+            "author_table_id": author_tid,
+            "video_table_id": video_tid,
+            "image_table_id": image_tid,
+            "comment_l1_table_id": l1_tid,
+            "comment_l2_table_id": l2_tid,
+        }
+
     def list_tables(self) -> list:
         """List all tables in the Bitable app."""
         url = f"{FEISHU_API_BASE}/bitable/v1/apps/{self.app_token}/tables"
@@ -254,6 +297,24 @@ class FeishuBitable:
             {"field_name": "获赞数", "type": 2},
             {"field_name": "作品数", "type": 2},
             {"field_name": "主页链接", "type": 15},
+        ]
+        self.add_fields(fields, table_id)
+
+    def setup_author_table(self, table_id: str = "") -> None:
+        """Fields for the 作者信息 table (author profile incl. 粉丝量).
+
+        Same shape as the 用户 table plus 爬取时间. 主页链接 is a raw-URL field.
+        """
+        fields = [
+            {"field_name": "用户ID", "type": 1},
+            {"field_name": "昵称", "type": 1},
+            {"field_name": "简介", "type": 1},
+            {"field_name": "粉丝数", "type": 2},
+            {"field_name": "关注数", "type": 2},
+            {"field_name": "获赞数", "type": 2},
+            {"field_name": "作品数", "type": 2},
+            {"field_name": "主页链接", "type": 15},      # raw URL (link == text)
+            {"field_name": "爬取时间", "type": 1},
         ]
         self.add_fields(fields, table_id)
 
@@ -460,6 +521,21 @@ def user_to_feishu_record(user) -> dict:
         "获赞数": user.total_favorited,
         "作品数": user.aweme_count,
         "主页链接": url_field(user.homepage_url),
+    }
+
+
+def author_to_feishu_record(user, crawl_time: str = "") -> dict:
+    """Record for the 作者信息 table — author profile with 粉丝量 (follower count)."""
+    return {
+        "用户ID": user.uid,
+        "昵称": user.nickname,
+        "简介": user.signature,
+        "粉丝数": user.follower_count,
+        "关注数": user.following_count,
+        "获赞数": user.total_favorited,
+        "作品数": user.aweme_count,
+        "主页链接": url_field(user.homepage_url),
+        "爬取时间": crawl_time,
     }
 
 

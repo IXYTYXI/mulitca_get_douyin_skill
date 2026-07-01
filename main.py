@@ -365,9 +365,83 @@ async def _scrape_to_bitable(keyword, folder_token, name,
                "COMMENT_L1_TABLE_ID / COMMENT_L2_TABLE_ID 为以上值。")
 
 
+@cli.command(name="scrape-author")
+@click.argument("url")
+@click.option("--folder", help="飞书文件夹 token 或 URL（新建多维表格的位置；留空建在应用空间）")
+@click.option("--name", default="抖音作者数据", help="新建多维表格的名称")
+@click.option("--recent-count", type=int, default=5, help="保留的作品数量（默认最近 5 条）")
+@click.option("--skip-top", type=int, default=3,
+              help="检测不到置顶标记(is_top)时回退跳过的前 N 条置顶视频（默认 3，即取第4-8条）")
+@click.option("--no-comments", is_flag=True, help="只抓作者信息+作品，跳过一/二级评论")
+@click.option("--headed", is_flag=True, help="用可见的本地浏览器代替无头浏览器（无头总崩溃时用）")
+@click.option("--ui-comments", is_flag=True, help="用模拟点击(真人登录态)抓评论，含二级评论(自动启用 headed)")
+@click.option("--structure-only", is_flag=True, help="只新建 5 张表结构，不抓数据")
+def scrape_author(url, folder, name, recent_count, skip_top,
+                  no_comments, headed, ui_comments, structure_only):
+    """从作者主页链接抓取：作者信息(粉丝量) + 选定作品(封面/视频/图片/点赞评论收藏) + 评论，写入 5 表多维表格。
+
+    默认跳过置顶视频后取最近 5 条（检测到 is_top 则丢弃置顶，否则回退为跳过前 --skip-top 条，
+    即第4-8条）。新建 5 张表：作者信息 / 视频作品 / 图文作品 / 一级评论 / 二级评论。
+    """
+    asyncio.run(_scrape_author(
+        url, _folder_token(folder), name, recent_count, skip_top,
+        no_comments, headed, ui_comments, structure_only,
+    ))
+
+
+async def _scrape_author(url, folder_token, name, recent_count, skip_top,
+                         no_comments, headed, ui_comments, structure_only):
+    # 1. Create the author-mode bitable (作者信息 + the canonical 4 tables).
+    feishu = FeishuBitable()
+    try:
+        ids = feishu.create_author_bitable(name, folder_token)
+    except RuntimeError as e:
+        msg = str(e)
+        click.echo(f"新建多维表格失败: {msg}")
+        if "DriveNodePermNotAllow" in msg or "1254701" in msg:
+            click.echo("原因: 自建应用对该文件夹没有写入权限。")
+            click.echo("请在飞书里打开该文件夹 → 右上角「...」/共享 → 添加你的自建应用为协作者并授予「可编辑」，")
+            click.echo("并确认应用已开通 drive:drive (云空间) 与 bitable:app 权限且已发布版本。")
+        feishu.close()
+        return
+    feishu.close()
+
+    # 2. Run the author pipeline into those tables (unless structure-only).
+    if not structure_only:
+        import scrape_all
+        scrape_all.APP_TOKEN = ids["app_token"]
+        scrape_all.AUTHOR_URL = url
+        scrape_all.AUTHOR_TABLE_ID = ids["author_table_id"]
+        scrape_all.VIDEO_TABLE_ID = ids["video_table_id"]
+        scrape_all.IMAGE_TABLE_ID = ids["image_table_id"]
+        scrape_all.COMMENT_L1_TABLE_ID = ids["comment_l1_table_id"]
+        scrape_all.COMMENT_L2_TABLE_ID = ids["comment_l2_table_id"]
+        scrape_all.AUTHOR_RECENT_COUNT = recent_count
+        scrape_all.AUTHOR_TOP_SKIP = skip_top
+        # Tag records by author (there is no search keyword in author mode).
+        scrape_all.KEYWORD = f"作者主页:{url}"
+        scrape_all.SKIP_COMMENTS = no_comments
+        if headed or ui_comments:
+            scrape_all.HEADLESS = False   # UI clicks / stability need a headed browser
+        if ui_comments:
+            scrape_all.USE_UI_COMMENTS = True
+        await scrape_all.main()
+
+    click.echo("\n=== 作者多维表格已就绪 ===")
+    click.echo(f"链接      : {ids['url']}")
+    click.echo(f"app_token : {ids['app_token']}")
+    click.echo(f"作者信息  : {ids['author_table_id']}")
+    click.echo(f"视频作品  : {ids['video_table_id']}")
+    click.echo(f"图文作品  : {ids['image_table_id']}")
+    click.echo(f"一级评论  : {ids['comment_l1_table_id']}")
+    click.echo(f"二级评论  : {ids['comment_l2_table_id']}")
+    click.echo("复用方法  : 在 .env 设置 FEISHU_APP_TOKEN / AUTHOR_TABLE_ID / VIDEO_TABLE_ID / "
+               "IMAGE_TABLE_ID / COMMENT_L1_TABLE_ID / COMMENT_L2_TABLE_ID，并设 DOUYIN_AUTHOR_URL，再跑 python scrape_all.py。")
+
+
 @cli.command()
 @click.option("--type", "table_type",
-              type=click.Choice(["video", "image", "comment-l1", "comment-l2", "user", "trending"]),
+              type=click.Choice(["video", "image", "comment-l1", "comment-l2", "user", "author", "trending"]),
               required=True)
 @click.option("--table-id", required=True, help="飞书表格 table_id")
 def setup_feishu(table_type, table_id):
@@ -379,6 +453,7 @@ def setup_feishu(table_type, table_id):
         "comment-l1": feishu.setup_comment_l1_table,
         "comment-l2": feishu.setup_comment_l2_table,
         "user": feishu.setup_user_table,
+        "author": feishu.setup_author_table,
         "trending": feishu.setup_trending_table,
     }
     setup_map[table_type](table_id)
